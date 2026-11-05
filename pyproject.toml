@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-lock"
+dynamic = ["version"]
+description = "Lock agent commands to the local HTTP proxy by running them as the user agentnet."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+keywords = ["claude", "codex", "proxy", "firewall", "agent", "mihomo", "clash"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+    "Topic :: System :: Networking :: Firewalls",
+]
+
+[project.scripts]
+agent-lock = "agent_lock.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jakoes-wu/agent-lock"
+Changelog = "https://github.com/jakoes-wu/agent-lock/blob/main/CHANGELOG.md"
+Issues = "https://github.com/jakoes-wu/agent-lock/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_lock.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

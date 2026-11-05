@@ -1,0 +1,37 @@
+name: Release assets
+
+# Publish a stable source archive and SHA256SUMS for install.sh.
+# GitHub's automatic source archive is not byte-stable, so it is not the checksum input.
+# The release event runs only when a person (not GITHUB_TOKEN) creates the release.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # The tag is referenced only through TAG, not inline in a run script.
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Build the source archive
+        run: |
+          git archive --format=tar.gz --prefix="agent-lock-${TAG}/" -o "agent-lock-${TAG}.tar.gz" HEAD
+          sha256sum "agent-lock-${TAG}.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Check the archive
+        run: |
+          mkdir check
+          tar -xzf "agent-lock-${TAG}.tar.gz" -C check
+          test -f "check/agent-lock-${TAG}/src/agent_lock/__init__.py"
+          version="$(python3 -c 'import re, sys; print(re.search(r"__version__ = \"([^\"]+)\"", open(sys.argv[1]).read()).group(1))' "check/agent-lock-${TAG}/src/agent_lock/__init__.py")"
+          test "v${version}" = "${TAG}" || { echo "__version__ ${version} does not match tag ${TAG}"; exit 1; }
+      - name: Upload to the release
+        run: gh release upload "${TAG}" "agent-lock-${TAG}.tar.gz" SHA256SUMS --clobber --repo "${GITHUB_REPOSITORY}"

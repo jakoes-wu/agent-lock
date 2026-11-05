@@ -1,0 +1,58 @@
+name: Publish to PyPI
+
+# Build an sdist and a wheel and upload them with PyPI Trusted Publishing.
+# No API token: PyPI issues a short-lived credential for this workflow and the pypi environment.
+# workflow_dispatch republishes a tag that was created before the publisher was registered.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check --strict dist/*
+          ls -l dist
+      - name: Check the version
+        # The wheel filename follows the normalized project name agent-lock.
+        run: |
+          version="${TAG#v}"
+          test -f "dist/agent_lock-${version}-py3-none-any.whl" || { echo "no wheel for ${version} in dist/"; exit 1; }
+          test -f "dist/agent_lock-${version}.tar.gz" || { echo "no sdist for ${version} in dist/"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

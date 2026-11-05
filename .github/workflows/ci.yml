@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+          - os: ubuntu-latest
+            python: "3.12"
+          # The macOS arm64 runners may not provide Python 3.8, so macOS starts at 3.10.
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install lint tools
+        run: python -m pip install pyflakes
+      - name: Lint
+        run: python -m pyflakes src tests
+      - name: Tests must not hard-code home directories
+        # helpers.py is excluded so a future path helper can build temps; tests must not name a real home.
+        run: "! grep -rnE '/Users/|/home/' tests --include='*.py' --exclude=helpers.py"
+      - name: Install shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Shellcheck installer and wrappers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, "src")
+          from agent_lock.wrapper import render_claude, render_switcher
+          os.makedirs("/tmp/agent-lock-sh", exist_ok=True)
+          with open("/tmp/agent-lock-sh/agent-lock", "w") as handle:
+              handle.write(render_switcher(7897, "/usr/sbin/runuser"))
+          with open("/tmp/agent-lock-sh/agent-lock-darwin", "w") as handle:
+              handle.write(render_switcher(7897, "", darwin=True))
+          with open("/tmp/agent-lock-sh/agent-lock-claude", "w") as handle:
+              handle.write(render_claude(7897))
+          PY
+          shellcheck -s sh /tmp/agent-lock-sh/agent-lock /tmp/agent-lock-sh/agent-lock-darwin /tmp/agent-lock-sh/agent-lock-claude install.sh
+      - name: Test
+        run: python -m unittest discover -s tests -t tests -v
