@@ -95,7 +95,7 @@ Filename completion is only offered for `--claude-dir`, `--share-dir`, `--trust-
 | macOS | pf `user` rules in an anchor inserted before `anchor "com.apple/*"` | `sysadminctl` when missing |
 | Windows | block rules for literal non-loopback ranges and for loopback ports other than the mixed port | `New-LocalUser`, not an Administrator |
 
-firewalld, a pf `pass quick` already sitting before the Apple anchor, or a Windows policy that does not merge local firewall rules is unsupported (`exit 4`). Install does not run `pfctl -d`.
+firewalld, a pf `pass quick` already sitting before the Apple anchor, or a Windows policy that does not merge local firewall rules is unsupported (`exit 4`). Install does not run `pfctl -d`. nftables that rejects `destroy table` is also unsupported and install exits 4. nftables 1.0.2 on Ubuntu 22.04 is one of those builds.
 
 ## Development
 

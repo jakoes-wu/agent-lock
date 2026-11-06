@@ -82,6 +82,15 @@ class Patches(object):
             setattr(obj, name, value)
 
 
+def _which_pfctl(real_which):
+    """Pretend pfctl is installed so the Darwin checks run on Linux CI."""
+    def which(name):
+        if name == "pfctl":
+            return "/sbin/pfctl"
+        return real_which(name)
+    return which
+
+
 def _args(**kwargs):
     class Args(object):
         pass
@@ -255,8 +264,12 @@ class OwnershipAndAclTest(unittest.TestCase):
             _confine(link, root, "share")
         desk = os.path.join(root, "Desktop", "proj")
         os.makedirs(desk)
-        with self.assertRaises(UsageError):
-            _confine(desk, root, "share")
+        if sys.platform == "darwin":
+            with self.assertRaises(UsageError):
+                _confine(desk, root, "share")
+        else:
+            kept_desk = _confine(desk, root, "share")
+            self.assertTrue(kept_desk.startswith(os.path.realpath(root)))
         kept = _confine(target, root, "share")
         self.assertTrue(kept.startswith(os.path.realpath(root)))
         outside = tempfile.mkdtemp()
@@ -575,6 +588,7 @@ class InstallFlowTest(unittest.TestCase):
 
         try:
             self._patch_paths(patches, paths)
+            patches.set(install.shutil, "which", _which_pfctl(install.shutil.which))
             patches.set(pwd, "getpwnam", lambda name: Record() if name == "agentnet" else pwd.getpwnam(name))
             with self.assertRaises(AgentLockError):
                 install._darwin_apply(_args(), _owner(tempfile.mkdtemp()), {"port": 7897, "source": "--port"}, [], runner, io.StringIO())
@@ -598,6 +612,7 @@ class InstallFlowTest(unittest.TestCase):
         patches = Patches()
         try:
             self._patch_paths(patches, paths)
+            patches.set(install.shutil, "which", _which_pfctl(install.shutil.which))
             patches.set(pwd, "getpwnam", lambda name: Record())
             with self.assertRaises(Unsupported) as caught:
                 install._darwin_apply(_args(), _owner(home), {"port": 7897, "source": "--port"}, [], syntax_runner, io.StringIO())
@@ -828,6 +843,7 @@ class InstallFlowTest(unittest.TestCase):
         try:
             sys.stderr = stderr
             self._patch_paths(patches, paths)
+            patches.set(sys, "platform", "darwin")
             patches.set(install, "load_state", lambda path=None: {
                 "agent_uid": 50, "agent_user": "agentnet", "created_user": False,
                 "links": [], "pf_enable_token": "TOK", "agent_home": root,

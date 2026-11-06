@@ -95,7 +95,7 @@ agent-lock completion powershell | Out-String | Add-Content $PROFILE
 | macOS | pf `user` 规则，锚点插在 `anchor "com.apple/*"` 之前 | 没有用户时 `sysadminctl` |
 | Windows | 用字面非回环地址段拦截，回环上只拦混合端口以外的端口 | `New-LocalUser`，不是 Administrator |
 
-firewalld 正在运行、Apple 锚点之前已经有 `pass quick`，或者 Windows 策略不合并本地防火墙规则时，安装不受支持（退出码 4）。安装不会执行 `pfctl -d`。
+firewalld 正在运行、Apple 锚点之前已经有 `pass quick`，或者 Windows 策略不合并本地防火墙规则时，安装不受支持（退出码 4）。安装不会执行 `pfctl -d`。不接受 `destroy table` 的 nftables 同样不受支持，安装退出 4。Ubuntu 22.04 自带的 nftables 1.0.2 就是这种情况。
 
 ## 开发
 
