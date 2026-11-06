@@ -597,7 +597,7 @@ def parse_locked_batch(text):
     }
 
 
-def windows_locked_command(sid, python, probe_path, proxy_argv, noproxy_argv):
+def windows_locked_command(sid, python, probe_source, proxy_argv, noproxy_argv):
     """One PowerShell process that runs the probe and both curls as agentnet.
 
     agent-lock.cmd exits 126 unless the caller is already that SID, so doctor
@@ -605,16 +605,19 @@ def windows_locked_command(sid, python, probe_path, proxy_argv, noproxy_argv):
     starts directly. Otherwise one Get-Credential logon starts the child;
     the password is not written to state or to the command line. Exit 126
     is not a result of this script.
+
+    The probe is `python -` with the source on that child's stdin. A script
+    file in the installing user's temp directory is not readable by agentnet.
     """
     if not sid or any(ch not in "S-0123456789" for ch in sid) or not sid.startswith("S-1-"):
         raise AgentLockError("could not read the agentnet SID")
-    if not proxy_argv or not noproxy_argv or not python or not probe_path:
+    if not proxy_argv or not noproxy_argv or not python or not probe_source:
         raise AgentLockError("locked probe was not run as agentnet")
 
     def arguments(argv):
         return " ".join('"' + str(part).replace('"', '\\"') + '"' for part in argv[1:])
 
-    probe_args = arguments([python, probe_path])
+    probe_args = arguments([python, "-"])
     proxy_args = arguments(proxy_argv)
     direct_args = arguments(noproxy_argv)
     lines = [
@@ -627,13 +630,14 @@ def windows_locked_command(sid, python, probe_path, proxy_argv, noproxy_argv):
         "  $cred = Get-Credential -UserName '.\\agentnet' -Message 'agent-lock doctor'",
         "  if (-not $cred) { exit 127 }",
         "}",
-        "function Invoke-Locked([string]$Name, [string]$File, [string]$Arguments) {",
+        "function Invoke-Locked([string]$Name, [string]$File, [string]$Arguments, [string]$Stdin) {",
         "  $psi = New-Object System.Diagnostics.ProcessStartInfo",
         "  $psi.FileName = $File",
         "  $psi.Arguments = $Arguments",
         "  $psi.UseShellExecute = $false",
         "  $psi.RedirectStandardOutput = $true",
         "  $psi.RedirectStandardError = $true",
+        "  if ($Stdin) { $psi.RedirectStandardInput = $true }",
         "  if ($me -ne $sid) {",
         "    $psi.UserName = 'agentnet'",
         "    $psi.Domain = '.'",
@@ -641,6 +645,10 @@ def windows_locked_command(sid, python, probe_path, proxy_argv, noproxy_argv):
         "    $psi.LoadUserProfile = $true",
         "  }",
         "  $proc = [System.Diagnostics.Process]::Start($psi)",
+        "  if ($Stdin) {",
+        "    $proc.StandardInput.Write($Stdin)",
+        "    $proc.StandardInput.Close()",
+        "  }",
         "  $out = $proc.StandardOutput.ReadToEnd()",
         "  $err = $proc.StandardError.ReadToEnd()",
         "  $proc.WaitForExit()",
@@ -650,9 +658,9 @@ def windows_locked_command(sid, python, probe_path, proxy_argv, noproxy_argv):
         "  Write-Output ($Name + '_OUT_B64=' + $outB)",
         "  Write-Output ($Name + '_ERR_B64=' + $errB)",
         "}",
-        "Invoke-Locked 'PROBE' " + _ps_single(python) + " " + _ps_single(probe_args),
-        "Invoke-Locked 'PROXY' " + _ps_single(proxy_argv[0]) + " " + _ps_single(proxy_args),
-        "Invoke-Locked 'NOPROXY' " + _ps_single(noproxy_argv[0]) + " " + _ps_single(direct_args),
+        "Invoke-Locked 'PROBE' " + _ps_single(python) + " " + _ps_single(probe_args) + " " + _ps_single(probe_source),
+        "Invoke-Locked 'PROXY' " + _ps_single(proxy_argv[0]) + " " + _ps_single(proxy_args) + " ''",
+        "Invoke-Locked 'NOPROXY' " + _ps_single(noproxy_argv[0]) + " " + _ps_single(direct_args) + " ''",
         "exit 0",
     ]
     script = "\n".join(lines) + "\n"

@@ -826,46 +826,35 @@ def _fill_windows_probes(report, state):
     """Owner probe stays this process. Locked probe and curls run as agentnet.
 
     agent-lock.cmd is not a switch: it exits 126 for the installing user.
+    The locked probe is python reading stdin, not a file in this user's temp.
     """
-    import tempfile
     from .windows import parse_locked_batch, windows_locked_command
     python = sys.executable or "python3"
     proxy = ["curl", "-sS", "-o", os.devnull, "--max-time", "5",
              "-x", state.get("proxy") or "", "https://example.com"]
     direct = ["curl", "-sS", "-o", os.devnull, "--max-time", "3",
               "--noproxy", "*", "https://1.1.1.1/"]
-    fd, probe_path = tempfile.mkstemp(prefix="agent-lock-probe-", suffix=".py")
     try:
-        os.write(fd, PROBE_SOURCE.encode("utf-8"))
-    finally:
-        os.close(fd)
-    try:
-        try:
-            command = windows_locked_command(
-                state.get("agent_sid") or "", python, probe_path, proxy, direct)
-        except AgentLockError:
-            command = None
-        result = _run(command, timeout=60) if command else None
-        if not result or result.returncode != 0:
-            code = 126 if result and result.returncode == 126 else 127
-            report["probe_code"] = code
-            report["probe_stderr"] = "locked probe was not run as agentnet"
-            report["proxy_code"] = code
-            report["noproxy_code"] = code
-        else:
-            parsed = parse_locked_batch(result.stdout or "")
-            report["probe_code"] = parsed["probe_code"] if parsed["probe_code"] is not None else 127
-            report["probe_stdout"] = parsed["probe_stdout"]
-            report["probe_stderr"] = parsed["probe_stderr"]
-            report["proxy_code"] = parsed["proxy_code"]
-            report["proxy_stderr"] = parsed["proxy_stderr"]
-            report["noproxy_code"] = parsed["noproxy_code"]
-            report["noproxy_stderr"] = parsed["noproxy_stderr"]
-    finally:
-        try:
-            os.remove(probe_path)
-        except OSError:
-            pass
+        command = windows_locked_command(
+            state.get("agent_sid") or "", python, PROBE_SOURCE, proxy, direct)
+    except AgentLockError:
+        command = None
+    result = _run(command, timeout=60) if command else None
+    if not result or result.returncode != 0:
+        code = 126 if result and result.returncode == 126 else 127
+        report["probe_code"] = code
+        report["probe_stderr"] = "locked probe was not run as agentnet"
+        report["proxy_code"] = code
+        report["noproxy_code"] = code
+    else:
+        parsed = parse_locked_batch(result.stdout or "")
+        report["probe_code"] = parsed["probe_code"] if parsed["probe_code"] is not None else 127
+        report["probe_stdout"] = parsed["probe_stdout"]
+        report["probe_stderr"] = parsed["probe_stderr"]
+        report["proxy_code"] = parsed["proxy_code"]
+        report["proxy_stderr"] = parsed["proxy_stderr"]
+        report["noproxy_code"] = parsed["noproxy_code"]
+        report["noproxy_stderr"] = parsed["noproxy_stderr"]
     owner = _run([python, "-c", PROBE_SOURCE], timeout=10)
     if owner:
         report["owner_probe_code"] = owner.returncode

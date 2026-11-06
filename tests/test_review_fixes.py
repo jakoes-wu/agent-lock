@@ -1161,16 +1161,24 @@ class RereviewTest(unittest.TestCase):
                  "-x", "http://127.0.0.1:7897", "https://example.com"]
         direct = ["curl", "-sS", "-o", os.devnull, "--max-time", "3",
                   "--noproxy", "*", "https://1.1.1.1/"]
-        command = windows_locked_command(sid, "python", "probe.py", proxy, direct)
+        import tempfile
+        command = windows_locked_command(sid, "python", doctor.PROBE_SOURCE, proxy, direct)
         script = command[-1]
         self.assertEqual(command[0], "powershell")
         self.assertIn("Get-Credential", script)
         self.assertIn("WindowsIdentity", script)
+        self.assertIn("RedirectStandardInput", script)
+        self.assertIn('"-"', script)
+        self.assertIn("import socket, sys", script)
+        self.assertIn("Invoke-Locked 'PROXY'", script)
+        self.assertIn("'curl'", script)
+        self.assertNotIn(tempfile.gettempdir(), script)
+        self.assertNotIn(".py", script)
         self.assertNotIn("agent-lock.cmd", script)
         self.assertNotIn("exit 126", script)
         self.assertNotIn("runas", script.lower())
         with self.assertRaises(AgentLockError):
-            windows_locked_command("not-a-sid", "python", "probe.py", proxy, direct)
+            windows_locked_command("not-a-sid", "python", doctor.PROBE_SOURCE, proxy, direct)
 
         denied = base64.b64encode(b"agent-lock-probe: denied 1\n").decode("ascii")
         empty = base64.b64encode(b"").decode("ascii")
@@ -1195,8 +1203,13 @@ class RereviewTest(unittest.TestCase):
             if argv[:1] == ["powershell"]:
                 blob = " ".join(str(part) for part in argv)
                 self.assertNotIn("agent-lock.cmd", blob)
+                self.assertNotIn(tempfile.gettempdir(), blob)
+                self.assertNotIn("agent-lock-probe-", blob)
+                self.assertIn('"-"', blob)
                 self.assertIn("Get-Credential", blob)
                 self.assertIn("WindowsIdentity", blob)
+                self.assertIn("RedirectStandardInput", blob)
+                self.assertIn("import socket, sys", blob)
                 return Result(0, batch)
             return Result(0, "agent-lock-probe: connected\n")
 
