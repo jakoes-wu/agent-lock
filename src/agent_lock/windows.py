@@ -4,8 +4,10 @@ A Block must not match 127.0.0.1:PORT or ::1:PORT. Loopback TCP uses dash
 ranges and omits an empty range when the port is 1 or 65535.
 """
 
+import base64
 import ipaddress
 import os
+import re
 import sys
 
 from .errors import AgentLockError, Unsupported, UsageError
@@ -231,10 +233,24 @@ def gpo_problem(profiles):
     return None
 
 
+def _outbound_action(value):
+    """Allow is 2, Block is 4. PowerShell 5.1 emits the enum as a number."""
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        return {2: "allow", 4: "block"}.get(value, "")
+    text = str(value).strip().lower()
+    if text.isdigit():
+        return {2: "allow", 4: "block"}.get(int(text), "")
+    if text in ("allow", "block"):
+        return text
+    return ""
+
+
 def default_outbound_problem(profiles):
     for profile in profiles or []:
-        action = profile.get("DefaultOutboundAction")
-        if action is not None and str(action).lower() == "block":
+        action = _outbound_action(profile.get("DefaultOutboundAction"))
+        if action == "block":
             return "DefaultOutboundAction is Block for {}".format(profile.get("name") or "profile")
     return None
 
@@ -324,15 +340,23 @@ def state_acl_commands(path, owner_name):
 
 
 def apply_state_acl(path, owner_name, runner=None):
-    """Explicit DACL. os.chmod is not an ACL on Windows."""
+    """Explicit DACL. A failed icacls leaves the inherited Users ACE, so it raises."""
     command = state_acl_commands(path, owner_name)
     if runner is None:
         import subprocess
-        subprocess.run(
+        result = subprocess.run(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, check=False)
+        code = result.returncode
+        detail = (result.stderr or result.stdout or "").strip()
     else:
-        runner(command)
+        result = runner(command)
+        code = getattr(result, "returncode", 1) if result else 1
+        detail = ""
+        if result:
+            detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    if code != 0:
+        raise AgentLockError("state ACL was not applied: {}".format(detail or "icacls failed"))
 
 
 def create_profile_script(sid):
@@ -492,18 +516,147 @@ def windows_profile_script():
 
 
 def windows_rule_script(sid):
-    """Outbound Block rules for this SID. The SID is a literal, not a name."""
+    """Outbound Block rules for this SID. LocalUser lives on the security filter."""
     if not sid or any(ch not in "S-0123456789" for ch in sid) or not sid.startswith("S-1-"):
         raise AgentLockError("could not read the agentnet SID")
     return (
         "Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True | "
-        "Where-Object { $_.LocalUser -like '*" + sid + "*' } | ForEach-Object { "
+        "Where-Object { [string](($_ | Get-NetFirewallSecurityFilter).LocalUser) -like '*"
+        + sid + "*' } | ForEach-Object { "
         "$port = $_ | Get-NetFirewallPortFilter; "
         "$addr = $_ | Get-NetFirewallAddressFilter; "
         "[PSCustomObject]@{ Name=$_.Name; Action='Block'; Protocol=$port.Protocol; "
         "RemoteAddress=$addr.RemoteAddress; RemotePort=$port.RemotePort; Enabled=$true } "
         "} | ConvertTo-Json -Compress"
     )
+
+
+def windows_user_script():
+    """Name and Enabled. Does not read group membership."""
+    return (
+        "Get-LocalUser -Name 'agentnet' -ErrorAction SilentlyContinue | "
+        "Select-Object Name, Enabled | ConvertTo-Json -Compress\n"
+    )
+
+
+def windows_path_executable(text):
+    """True when an icacls ACE for the agentnet account grants execute.
+
+    The account is `agentnet:`, not the word anywhere in the path. A path
+    that merely contains that word must not inherit another user's (F).
+    """
+    pattern = re.compile(r"(?:^|[\s\\.])agentnet:((?:\([^)]*\))+)", re.IGNORECASE)
+    for line in (text or "").splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        grant = match.group(1)
+        if "(F)" in grant or "(M)" in grant:
+            return True
+        if re.search(r"\([^)]*X", grant):
+            return True
+    return False
+
+
+def _ps_single(text):
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def parse_locked_batch(text):
+    """Exit codes and captured streams from the agentnet probe batch."""
+    found = {}
+    for line in (text or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        found[key.strip()] = value
+
+    def decode(name):
+        raw = found.get(name, "")
+        if not raw:
+            return ""
+        try:
+            return base64.b64decode(raw).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            return ""
+
+    def code(name):
+        raw = found.get(name, "").strip()
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+        return None
+
+    return {
+        "probe_code": code("PROBE_CODE"),
+        "probe_stdout": decode("PROBE_OUT_B64"),
+        "probe_stderr": decode("PROBE_ERR_B64"),
+        "proxy_code": code("PROXY_CODE"),
+        "proxy_stderr": decode("PROXY_ERR_B64"),
+        "noproxy_code": code("NOPROXY_CODE"),
+        "noproxy_stderr": decode("NOPROXY_ERR_B64"),
+    }
+
+
+def windows_locked_command(sid, python, probe_path, proxy_argv, noproxy_argv):
+    """One PowerShell process that runs the probe and both curls as agentnet.
+
+    agent-lock.cmd exits 126 unless the caller is already that SID, so doctor
+    does not invoke it. When this process is already agentnet the payload
+    starts directly. Otherwise one Get-Credential logon starts the child;
+    the password is not written to state or to the command line. Exit 126
+    is not a result of this script.
+    """
+    if not sid or any(ch not in "S-0123456789" for ch in sid) or not sid.startswith("S-1-"):
+        raise AgentLockError("could not read the agentnet SID")
+    if not proxy_argv or not noproxy_argv or not python or not probe_path:
+        raise AgentLockError("locked probe was not run as agentnet")
+
+    def arguments(argv):
+        return " ".join('"' + str(part).replace('"', '\\"') + '"' for part in argv[1:])
+
+    probe_args = arguments([python, probe_path])
+    proxy_args = arguments(proxy_argv)
+    direct_args = arguments(noproxy_argv)
+    lines = [
+        "$ErrorActionPreference = 'Continue'",
+        "$sid = " + _ps_single(sid),
+        "$me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        "$cred = $null",
+        "if ($me -ne $sid) {",
+        "  if (-not [Environment]::UserInteractive) { exit 127 }",
+        "  $cred = Get-Credential -UserName '.\\agentnet' -Message 'agent-lock doctor'",
+        "  if (-not $cred) { exit 127 }",
+        "}",
+        "function Invoke-Locked([string]$Name, [string]$File, [string]$Arguments) {",
+        "  $psi = New-Object System.Diagnostics.ProcessStartInfo",
+        "  $psi.FileName = $File",
+        "  $psi.Arguments = $Arguments",
+        "  $psi.UseShellExecute = $false",
+        "  $psi.RedirectStandardOutput = $true",
+        "  $psi.RedirectStandardError = $true",
+        "  if ($me -ne $sid) {",
+        "    $psi.UserName = 'agentnet'",
+        "    $psi.Domain = '.'",
+        "    $psi.Password = $cred.Password",
+        "    $psi.LoadUserProfile = $true",
+        "  }",
+        "  $proc = [System.Diagnostics.Process]::Start($psi)",
+        "  $out = $proc.StandardOutput.ReadToEnd()",
+        "  $err = $proc.StandardError.ReadToEnd()",
+        "  $proc.WaitForExit()",
+        "  $outB = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$out))",
+        "  $errB = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$err))",
+        "  Write-Output ($Name + '_CODE=' + $proc.ExitCode)",
+        "  Write-Output ($Name + '_OUT_B64=' + $outB)",
+        "  Write-Output ($Name + '_ERR_B64=' + $errB)",
+        "}",
+        "Invoke-Locked 'PROBE' " + _ps_single(python) + " " + _ps_single(probe_args),
+        "Invoke-Locked 'PROXY' " + _ps_single(proxy_argv[0]) + " " + _ps_single(proxy_args),
+        "Invoke-Locked 'NOPROXY' " + _ps_single(noproxy_argv[0]) + " " + _ps_single(direct_args),
+        "exit 0",
+    ]
+    script = "\n".join(lines) + "\n"
+    return ["powershell", "-NoProfile", "-Command", script]
 
 
 def windows_admin_script():

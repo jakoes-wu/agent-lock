@@ -107,8 +107,10 @@ class DoctorParseTest(unittest.TestCase):
         self.assertTrue(noproxy_locked(56, "Connection timed out"))
         self.assertFalse(noproxy_locked(0, "Connection timed out"))
         self.assertFalse(noproxy_locked(127, "Connection refused"))
+        self.assertFalse(noproxy_locked(126, "Connection refused"))
         self.assertFalse(noproxy_locked(None, ""))
         self.assertTrue(probe_denied("agent-lock-probe: denied 1\n", "", 1))
+        self.assertFalse(probe_denied("agent-lock-probe: denied 1\n", "", 126))
         self.assertFalse(probe_denied("agent-lock-probe: connected\n", "", 0))
         self.assertFalse(probe_denied("", "ModuleNotFoundError", 1))
         self.assertFalse(probe_denied("", "", 127))
@@ -142,6 +144,16 @@ class DoctorParseTest(unittest.TestCase):
         names = _by_name(checks)
         self.assertIn("the proxy is not up", names["proxy-ok"]["detail"])
         self.assertIn("the lock is not in effect", names["raw-tcp-fail"]["detail"])
+        checks, code = evaluate(_report(
+            proxy_code=126, noproxy_code=126, probe_code=126,
+            probe_stdout="agent-lock-probe: denied 1\n"))
+        self.assertEqual(code, 1)
+        names = _by_name(checks)
+        self.assertFalse(names["proxy-ok"]["ok"])
+        self.assertIn("126", names["proxy-ok"]["detail"])
+        self.assertFalse(names["noproxy-fail"]["ok"])
+        self.assertFalse(names["raw-tcp-fail"]["ok"])
+        self.assertTrue(names["owner-tcp-ok"]["ok"])
 
     def test_sudo_env_and_bin_dir(self):
         checks, code = evaluate(_report(seen_identity={"user": "root", "logname": "root", "home": "/root"}))

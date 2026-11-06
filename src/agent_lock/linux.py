@@ -10,7 +10,7 @@ import stat
 import subprocess
 
 from .errors import AgentLockError, Unsupported
-from .state import AGENT_USER, LINUX_AGENT_HOME
+from .state import AGENT_USER, LINUX_AGENT_HOME, _within
 
 NFT_CONF = "/etc/agent-lock/nftables.conf"
 UNIT_PATH = "/etc/systemd/system/agent-lock-nft.service"
@@ -264,22 +264,13 @@ def parent_dirs(path, owner_home):
     parents = []
     current = os.path.dirname(path)
     while current and current != os.path.dirname(current):
-        if _is_same_or_under(current, home) or current == home:
+        if _within(current, home):
             parents.append(current)
         if current == home:
             break
         current = os.path.dirname(current)
     parents.reverse()
     return parents
-
-
-def _is_same_or_under(path, root):
-    path = os.path.abspath(path)
-    root = os.path.abspath(root)
-    try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:
-        return False
 
 
 def setfacl_commands(entries):

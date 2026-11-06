@@ -64,6 +64,7 @@ from .state import (
     SUDOERS_PATH,
     SWITCHER_PATH,
     WINDOWS_CMD,
+    _within,
     apply_install_fields,
     atomic_write,
     config_base,
@@ -141,13 +142,6 @@ def _expand(path, owner_home):
     return os.path.abspath(path)
 
 
-def _under_home(path, home):
-    try:
-        return os.path.commonpath([os.path.abspath(path), os.path.abspath(home)]) == os.path.abspath(home)
-    except ValueError:
-        return False
-
-
 def _confine(path, owner_home, kind):
     """realpath under the installing user's home. Symlinks and .. escapes are refused."""
     expanded = _expand(path, owner_home)
@@ -155,7 +149,7 @@ def _confine(path, owner_home, kind):
         raise UsageError("refusing a symlink: {}".format(path))
     real = os.path.realpath(expanded)
     home = os.path.realpath(owner_home)
-    if not _under_home(real, home):
+    if not _within(real, home):
         raise UsageError("path is outside the installing user's home: {}".format(path))
     if kind == "share" and os.path.normcase(os.path.normpath(real)) == os.path.normcase(os.path.normpath(home)):
         raise UsageError("refusing to share the home directory")
@@ -169,21 +163,17 @@ def _claude_dirname_ok(directory):
     return name == ".claude" or name.endswith(".claude")
 
 
-def _discovered_fields(found):
-    """A --port fallback keeps the stored controller and secret."""
-    if not found or found.get("source") == "--port":
-        return None, None
-    controller = found.get("controller")
-    secret = found.get("secret")
-    if controller is None:
-        controller = ""
-    if secret is None:
-        secret = ""
-    return controller, secret
-
-
 def _state_after_install(old, owner, port, extra, found):
-    controller, secret = _discovered_fields(found)
+    """--port keeps a stored controller and secret. A real discovery may clear them."""
+    controller = None
+    secret = None
+    if found and found.get("source") != "--port":
+        controller = found.get("controller")
+        if controller is None:
+            controller = ""
+        secret = found.get("secret")
+        if secret is None:
+            secret = ""
     if not old:
         return new_state(owner, port, controller or "", secret or "", extra)
     return apply_install_fields(old, port, extra, controller, secret)
@@ -429,6 +419,13 @@ def _pf_reload(runner, path, strict):
         runner(load_conf_argv(path))
 
 
+def _reload_darwin_firewall(runner):
+    """pfctl -f the restored main ruleset, then the restored anchor if it is still a file."""
+    _pf_reload(runner, PF_CONF, False)
+    if os.path.isfile(ANCHOR_PATH) and not os.path.islink(ANCHOR_PATH):
+        runner(load_anchor_argv(ANCHOR_PATH))
+
+
 def _linux_identity():
     import grp
     import pwd
@@ -527,13 +524,17 @@ def _linux_apply(args, owner, found, extra, runner, stdout):
         _ok(runner, ["setfacl", "-h", "-m", spec, path])
     setting_paths = _posix_settings_paths(args, owner)
     settings_saved = _snapshot(setting_paths)
+    old = load_state()
     try:
         _stop_claude_daemon(runner)
     except AgentLockError:
         _restore(saved)
+        if old and old.get("port"):
+            _ok(runner, nft_load_argv(nft, NFT_CONF))
+        else:
+            runner([nft, "delete", "table", "inet", "agentlock"])
         raise
     settings = _write_settings(setting_paths, CLAUDE_WRAPPER_PATH, owner)
-    old = load_state()
     if not _proxy_check(runner, [runuser, "--preserve-environment", "-u", AGENT_USER, "--", SWITCHER_PATH], proxy_url(port)):
         _restore(saved + settings_saved)
         if old and old.get("port"):
@@ -622,6 +623,7 @@ def _darwin_apply(args, owner, found, extra, runner, stdout):
         _stop_claude_daemon(runner)
     except AgentLockError:
         _restore(saved)
+        _reload_darwin_firewall(runner)
         raise
     settings = _write_settings(setting_paths, CLAUDE_WRAPPER_PATH, owner)
     if not _proxy_check(
@@ -629,6 +631,8 @@ def _darwin_apply(args, owner, found, extra, runner, stdout):
         _restore(saved + settings_saved)
         if already:
             runner(load_anchor_argv(ANCHOR_PATH))
+        else:
+            _reload_darwin_firewall(runner)
         raise AgentLockError("proxy check failed; kept the previous port")
     old = load_state()
     data = _state_after_install(old, owner, port, extra, found)
@@ -855,13 +859,26 @@ def _unlink_recorded(path):
     raise AgentLockError("recorded link is not a symlink or junction; left it in place: {}".format(path))
 
 
-def _strip_settings(entries):
+def _strip_settings(entries, state=None):
+    owner_uid = (state or {}).get("owner_uid")
+    owner_gid = None
+    if owner_uid and is_root():
+        import pwd
+        try:
+            owner_gid = pwd.getpwuid(int(owner_uid)).pw_gid
+            owner_uid = int(owner_uid)
+        except (KeyError, TypeError, ValueError):
+            owner_uid = None
+            owner_gid = None
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
         path = entry.get("path")
         if not path or os.path.islink(path) or not os.path.isfile(path):
             continue
+        st = os.lstat(path)
+        mode = stat.S_IMODE(st.st_mode)
+        uid, gid = st.st_uid, st.st_gid
         text = _read_text(path) or ""
         try:
             document = json.loads(text) if text.strip() else {}
@@ -870,8 +887,15 @@ def _strip_settings(entries):
         document, empty = strip_claude_settings(document)
         if entry.get("created") and empty:
             os.remove(path)
-        else:
-            atomic_write(path, json.dumps(document, indent=2, sort_keys=True) + "\n", 0o600)
+            continue
+        atomic_write(path, json.dumps(document, indent=2, sort_keys=True) + "\n", mode)
+        if is_root():
+            target_uid = owner_uid if owner_uid else uid
+            target_gid = owner_gid if owner_gid is not None else gid
+            try:
+                os.chown(path, target_uid, target_gid)
+            except OSError:
+                pass
 
 
 def cmd_uninstall(args, stdout=None, stderr=None, runner=None):
@@ -911,7 +935,7 @@ def cmd_uninstall(args, stdout=None, stderr=None, runner=None):
         if os.path.isfile(WINDOWS_CMD):
             os.remove(WINDOWS_CMD)
     if sys.platform != "win32":
-        _strip_settings(state.get("claude_settings"))
+        _strip_settings(state.get("claude_settings"), state)
     _remove_user_keep_home(state, runner)
     path = None
     from .state import state_path

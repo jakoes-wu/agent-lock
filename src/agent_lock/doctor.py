@@ -40,18 +40,25 @@ _ADMIN_GROUPS = ("sudo", "wheel", "admin", "adm", "Administrators")
 
 
 def noproxy_locked(code, stderr):
-    """True only for curl 28, curl 7, or the listed error text. Exit 0 and 127 are not a lock."""
+    """True only for curl 28, curl 7, or the listed error text.
+
+    Exit 0, 126, and 127 are not a lock. 126 is the cmd refusing the owner.
+    """
     if code in (28, 7):
         return True
-    if code in (0, 127, None):
+    if code in (0, 126, 127, None):
         return False
     text = stderr or ""
     return any(marker in text for marker in NOPROXY_TEXT)
 
 
 def probe_denied(stdout, stderr, code):
-    """True only when the probe printed denied and did not connect."""
-    if code == 127 or code is None:
+    """True only when the probe printed denied and did not connect.
+
+    Exit 126 is the Windows cmd refusing a caller who is not agentnet.
+    That refusal did not attempt the connection, so it is not a lock.
+    """
+    if code in (126, 127, None):
         return False
     text = (stdout or "") + (stderr or "")
     if "ModuleNotFoundError" in text or "agent-lock-probe: connected" in (stdout or ""):
@@ -352,15 +359,20 @@ def _account_check(report, platform):
 
 
 def switcher_mode_problem(uid, mode, platform, owner_name=""):
-    """Root (Administrators on Windows) and not group-writable. Missing mode fails."""
+    """Root (Administrators on Windows) and, on POSIX, not group-writable.
+
+    CPython reports a writable Windows file as 0o666. That bit is not an ACL,
+    so Windows fails only when the owner is not Administrators or the mode
+    was not read.
+    """
     if mode is None:
         return "switcher mode was not read"
-    if mode & stat.S_IWGRP:
-        return "switcher is group-writable"
     if platform == "windows":
         if "administrators" not in (owner_name or "").lower():
             return "windows switcher is not owned by Administrators"
         return None
+    if mode & stat.S_IWGRP:
+        return "switcher is group-writable"
     if uid != 0:
         return "switcher is not owned by root"
     return None
@@ -461,6 +473,8 @@ def _proxy_check(report):
     if report.get("proxy_missing"):
         return "fail", "curl is missing; the proxy check did not run"
     code = report.get("proxy_code")
+    if code == 126:
+        return "fail", "exit 126 is not a successful proxy check"
     if code == 0:
         return "pass", "proxy curl exited 0"
     stderr = report.get("proxy_stderr") or ""
@@ -744,6 +758,25 @@ def _account_facts(state, platform):
         groups = _run(["id", "-Gn", "agentnet"])
         if groups and groups.returncode == 0:
             facts["groups"] = groups.stdout.split()
+    elif platform == "windows":
+        from .windows import windows_admin_script, windows_user_script
+        result = _run(["powershell", "-NoProfile", "-Command", windows_user_script()])
+        raw = (result.stdout or "").strip() if result and result.returncode == 0 else ""
+        data = None
+        if raw:
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict) and data.get("Name"):
+            facts["exists"] = True
+            enabled = data.get("Enabled")
+            facts["enabled"] = enabled is True or str(enabled).lower() == "true"
+        admin = _run(["powershell", "-NoProfile", "-Command", windows_admin_script()])
+        if admin and "yes" in (admin.stdout or "").lower():
+            facts["groups"] = ["Administrators"]
     return facts
 
 
@@ -789,6 +822,57 @@ def _claude_version():
     return (result.stdout or "") + (result.stderr or "")
 
 
+def _fill_windows_probes(report, state):
+    """Owner probe stays this process. Locked probe and curls run as agentnet.
+
+    agent-lock.cmd is not a switch: it exits 126 for the installing user.
+    """
+    import tempfile
+    from .windows import parse_locked_batch, windows_locked_command
+    python = sys.executable or "python3"
+    proxy = ["curl", "-sS", "-o", os.devnull, "--max-time", "5",
+             "-x", state.get("proxy") or "", "https://example.com"]
+    direct = ["curl", "-sS", "-o", os.devnull, "--max-time", "3",
+              "--noproxy", "*", "https://1.1.1.1/"]
+    fd, probe_path = tempfile.mkstemp(prefix="agent-lock-probe-", suffix=".py")
+    try:
+        os.write(fd, PROBE_SOURCE.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        try:
+            command = windows_locked_command(
+                state.get("agent_sid") or "", python, probe_path, proxy, direct)
+        except AgentLockError:
+            command = None
+        result = _run(command, timeout=60) if command else None
+        if not result or result.returncode != 0:
+            code = 126 if result and result.returncode == 126 else 127
+            report["probe_code"] = code
+            report["probe_stderr"] = "locked probe was not run as agentnet"
+            report["proxy_code"] = code
+            report["noproxy_code"] = code
+        else:
+            parsed = parse_locked_batch(result.stdout or "")
+            report["probe_code"] = parsed["probe_code"] if parsed["probe_code"] is not None else 127
+            report["probe_stdout"] = parsed["probe_stdout"]
+            report["probe_stderr"] = parsed["probe_stderr"]
+            report["proxy_code"] = parsed["proxy_code"]
+            report["proxy_stderr"] = parsed["proxy_stderr"]
+            report["noproxy_code"] = parsed["noproxy_code"]
+            report["noproxy_stderr"] = parsed["noproxy_stderr"]
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    owner = _run([python, "-c", PROBE_SOURCE], timeout=10)
+    if owner:
+        report["owner_probe_code"] = owner.returncode
+        report["owner_probe_stdout"] = owner.stdout
+        report["owner_probe_stderr"] = owner.stderr
+
+
 def _fill_network(report, state, platform):
     """Run the curl and TCP probes. Firewall queries use sudo and may fail closed."""
     python = sys.executable or "python3"
@@ -800,28 +884,31 @@ def _fill_network(report, state, platform):
         parsed, count = _pf_block_count()
         report["pf_counter_parsed"] = parsed
         report["pf_before"] = count
-    if switcher and os.path.isfile(switcher):
-        locked = _run([switcher] + probe, timeout=15)
-        if locked:
-            report["probe_code"] = locked.returncode
-            report["probe_stdout"] = locked.stdout
-            report["probe_stderr"] = locked.stderr
-        if not report["proxy_missing"]:
-            proxy = _run([switcher, "curl", "-sS", "-o", os.devnull, "--max-time", "5",
-                          "-x", state.get("proxy") or "", "https://example.com"], timeout=15)
-            if proxy:
-                report["proxy_code"] = proxy.returncode
-                report["proxy_stderr"] = proxy.stderr
-            direct = _run([switcher, "curl", "-sS", "-o", os.devnull, "--max-time", "3",
-                           "--noproxy", "*", "https://1.1.1.1/"], timeout=15)
-            if direct:
-                report["noproxy_code"] = direct.returncode
-                report["noproxy_stderr"] = direct.stderr
-    owner = _run(probe, timeout=10)
-    if owner:
-        report["owner_probe_code"] = owner.returncode
-        report["owner_probe_stdout"] = owner.stdout
-        report["owner_probe_stderr"] = owner.stderr
+    if platform == "windows":
+        _fill_windows_probes(report, state)
+    else:
+        if switcher and os.path.isfile(switcher):
+            locked = _run([switcher] + probe, timeout=15)
+            if locked:
+                report["probe_code"] = locked.returncode
+                report["probe_stdout"] = locked.stdout
+                report["probe_stderr"] = locked.stderr
+            if not report["proxy_missing"]:
+                proxy = _run([switcher, "curl", "-sS", "-o", os.devnull, "--max-time", "5",
+                              "-x", state.get("proxy") or "", "https://example.com"], timeout=15)
+                if proxy:
+                    report["proxy_code"] = proxy.returncode
+                    report["proxy_stderr"] = proxy.stderr
+                direct = _run([switcher, "curl", "-sS", "-o", os.devnull, "--max-time", "3",
+                               "--noproxy", "*", "https://1.1.1.1/"], timeout=15)
+                if direct:
+                    report["noproxy_code"] = direct.returncode
+                    report["noproxy_stderr"] = direct.stderr
+        owner = _run(probe, timeout=10)
+        if owner:
+            report["owner_probe_code"] = owner.returncode
+            report["owner_probe_stdout"] = owner.stdout
+            report["owner_probe_stderr"] = owner.stderr
     if platform == "linux":
         report["drop_after"] = _linux_drop_packets()
     elif platform == "darwin":
@@ -1206,7 +1293,20 @@ def daemon_service_paths(home):
 
 def _fill_claude(report, state, platform):
     if platform == "windows":
-        report["exec_access_ok"] = not state.get("exec_paths")
+        from .windows import windows_path_executable
+        paths = list(state.get("exec_paths") or [])
+        if not paths:
+            report["exec_access_ok"] = True
+            report["exec_access_detail"] = "no recorded launchers"
+            return
+        codes = []
+        for path in paths:
+            result = _run(["icacls", path])
+            text = (result.stdout or "") if result and result.returncode == 0 else ""
+            codes.append(0 if windows_path_executable(text) else 1)
+        problem = exec_access_problem(codes)
+        report["exec_access_ok"] = problem is None
+        report["exec_access_detail"] = problem or "recorded paths are executable"
         return
     switcher = state.get("wrapper") or ""
     owner = state.get("owner") or ""

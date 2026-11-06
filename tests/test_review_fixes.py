@@ -25,9 +25,10 @@ from agent_lock.doctor import (
 from agent_lock.errors import AgentLockError, Unsupported, UsageError
 from agent_lock.install import (
     _confine,
-    _discovered_fields,
     _gather,
     _posix_settings_paths,
+    _state_after_install,
+    _strip_settings,
     _unlink_recorded,
     _write_settings,
     agent_uid_busy,
@@ -35,16 +36,24 @@ from agent_lock.install import (
     open_directory_nofollow,
     prepare_bind_dir,
 )
-from agent_lock.linux import nft_observed, setfacl_commands
-from agent_lock.state import apply_install_fields, save_state
+from agent_lock.linux import nft_observed, parent_dirs, setfacl_commands
+from agent_lock.state import save_state
 from agent_lock.windows import (
+    apply_state_acl,
     build_rules,
+    default_outbound_problem,
     icacls_commands,
+    parse_locked_batch,
+    require_supported,
     rule_names,
     rule_phases,
     state_acl_commands,
     windows_firewall_report,
+    windows_locked_command,
     windows_observed,
+    windows_path_executable,
+    windows_rule_script,
+    windows_user_script,
 )
 from agent_lock.wrapper import render_claude, render_sudoers, render_switcher
 from test_doctor_parse import _report
@@ -129,13 +138,22 @@ class DiscoverySecurityTest(unittest.TestCase):
 
         found = choose_port(7897, False, [Candidate("http://127.0.0.1:9090", "LEAK", "scan", "tcp")], down)
         self.assertEqual(found["source"], "--port")
-        self.assertEqual(_discovered_fields(found), (None, None))
+        owner = _owner(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(owner["home"], ignore_errors=True))
         old = {"version": 1, "port": 1, "secret": "keep", "controller": "http://127.0.0.1:9", "extra_tcp": []}
-        updated = apply_install_fields(old, 7897, [], None, None)
+        leaky = dict(found)
+        leaky["secret"] = "LEAK"
+        leaky["controller"] = "http://127.0.0.1:1"
+        updated = _state_after_install(old, owner, 7897, [], leaky)
         self.assertEqual(updated["secret"], "keep")
         self.assertEqual(updated["controller"], "http://127.0.0.1:9")
-        cleared = apply_install_fields(old, 7897, [], "http://127.0.0.1:9090", "")
+        cleared = _state_after_install(old, owner, 7897, [], {
+            "source": "file", "port": 7897, "controller": "http://127.0.0.1:9090", "secret": "",
+        })
         self.assertEqual(cleared["secret"], "")
+        missing = _state_after_install(old, owner, 7897, [], {"source": "file", "port": 7897})
+        self.assertEqual(missing["secret"], "")
+        self.assertEqual(missing["controller"], "")
 
     def test_gather_does_not_stamp_stdin_secret_on_scanned_tcp(self):
         sent = []
@@ -156,7 +174,11 @@ class DiscoverySecurityTest(unittest.TestCase):
         self.assertEqual(found["source"], "--port")
         self.assertFalse(any(secret == "STDINSECRET" for _address, secret in sent))
         self.assertFalse(any(address.startswith("http://") for address, _secret in sent))
-        self.assertIsNone(_discovered_fields(found)[1])
+        kept = _state_after_install(
+            {"version": 1, "port": 1, "secret": "keep", "controller": "http://127.0.0.1:9", "extra_tcp": []},
+            _owner(home), found["port"], [], found)
+        self.assertEqual(kept["secret"], "keep")
+        self.assertEqual(kept["controller"], "http://127.0.0.1:9")
 
 
 class OwnershipAndAclTest(unittest.TestCase):
@@ -418,6 +440,10 @@ class FirewallObservationTest(unittest.TestCase):
         self.assertTrue(switcher_mode_problem(0, 0o775, "linux"))
         self.assertTrue(switcher_mode_problem(None, None, "linux"))
         self.assertIsNone(switcher_mode_problem(None, 0o755, "windows", "BUILTIN\\Administrators"))
+        self.assertIsNone(switcher_mode_problem(None, 0o666, "windows", "BUILTIN\\Administrators"))
+        self.assertTrue(switcher_mode_problem(0, 0o666, "linux"))
+        self.assertTrue(switcher_mode_problem(None, None, "windows", "Administrators"))
+        self.assertTrue(switcher_mode_problem(None, 0o644, "windows", "Users"))
         self.assertTrue(switcher_mode_problem(None, 0o755, "windows", "Users"))
         checks, code = evaluate(_report())
         self.assertEqual(code, 0, checks)
@@ -619,8 +645,51 @@ class InstallFlowTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         self.assertIn("daemon", str(caught.exception))
         self.assertTrue(any(item[:2] == ["setfacl", "-h"] for item in calls))
+        claude_at = next(i for i, item in enumerate(calls) if item[:1] == ["claude"])
+        self.assertTrue(any(
+            i > claude_at and item[1:5] == ["delete", "table", "inet", "agentlock"]
+            for i, item in enumerate(calls)))
         with open(settings, "r", encoding="utf-8") as handle:
             self.assertIn("keep", handle.read())
+
+        calls[:] = []
+        with open(paths["NFT_CONF"], "w", encoding="utf-8") as handle:
+            handle.write("old-table\n")
+
+        def previous_runner(argv, input_text=None):
+            calls.append(list(argv))
+            if argv[:3] == ["systemctl", "is-active", "firewalld.service"]:
+                return Result(3, "inactive\n")
+            if argv[:1] == ["claude"]:
+                return Result(1, "", "still running")
+            return Result(0, "")
+
+        patches = Patches()
+        try:
+            self._patch_paths(patches, paths)
+            patches.set(install, "find_nft", lambda: "/usr/sbin/nft")
+            patches.set(install, "find_runuser", lambda: "/usr/sbin/runuser")
+            patches.set(install, "_linux_identity", lambda: (True, True, True, "/usr/sbin/nologin", 50, 50))
+            patches.set(install, "load_state", lambda path=None: {"version": 1, "port": 7000})
+            patches.set(install.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+            with self.assertRaises(AgentLockError) as caught:
+                install._linux_apply(
+                    _args(trust_exec=[trust]), _owner(home),
+                    {"port": 7897, "source": "--port"}, [], previous_runner, io.StringIO())
+        finally:
+            patches.restore()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("daemon", str(caught.exception))
+        claude_at = next(i for i, item in enumerate(calls) if item[:1] == ["claude"])
+        reloads = [
+            item for i, item in enumerate(calls)
+            if i > claude_at and str(item[0]).endswith("nft") and "-f" in item and "-c" not in item
+        ]
+        self.assertTrue(reloads)
+        self.assertFalse(any(
+            i > claude_at and item[1:3] == ["delete", "table"] for i, item in enumerate(calls)))
+        with open(paths["NFT_CONF"], "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old-table\n")
 
     def test_windows_admin_skips_rules_and_proxy_restores_cmd(self):
         _root, paths = self._paths()
@@ -777,6 +846,495 @@ class InstallFlowTest(unittest.TestCase):
         self.assertNotIn("pfctl -d", stderr.getvalue())
         self.assertIn("pfctl -f drops anchors", stderr.getvalue())
         self.assertFalse(os.path.exists(paths["ANCHOR_PATH"]))
+
+    def test_darwin_failure_reloads_restored_rules(self):
+        import pwd
+        _root, paths = self._paths()
+        home = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        os.mkdir(os.path.join(home, ".claude"))
+        settings = os.path.join(home, ".claude", "settings.json")
+        original_settings = '{"keep": true}\n'
+        with open(settings, "w", encoding="utf-8") as handle:
+            handle.write(original_settings)
+        original_pf = "# original rules\n"
+        with open(paths["PF_CONF"], "w", encoding="utf-8") as handle:
+            handle.write(original_pf)
+        with open(paths["ANCHOR_PATH"], "w", encoding="utf-8") as handle:
+            handle.write("old-anchor\n")
+
+        class Record(object):
+            pw_uid = 4
+            pw_gid = 4
+            pw_dir = tempfile.gettempdir()
+            pw_name = "agentnet"
+
+        def which(name):
+            if name == "pfctl":
+                return "/sbin/pfctl"
+            if name == "claude":
+                return "/usr/bin/claude"
+            return None
+
+        def conf_loads(calls, after):
+            return [i for i, item in enumerate(calls) if i > after and item[:2] == ["pfctl", "-f"]]
+
+        def anchor_loads(calls, after):
+            return [
+                i for i, item in enumerate(calls)
+                if i > after and item[:3] == ["pfctl", "-a", "agentlock"]
+            ]
+
+        calls = []
+
+        def stop_runner(argv, input_text=None):
+            calls.append(list(argv))
+            if argv[:2] == ["id", "-Gn"]:
+                return Result(0, "staff\n")
+            if argv[:1] == ["claude"]:
+                return Result(1, "", "still running")
+            return Result(0, "")
+
+        def proxy_runner(argv, input_text=None):
+            calls.append(list(argv))
+            if argv[:2] == ["id", "-Gn"]:
+                return Result(0, "staff\n")
+            if "curl" in argv:
+                return Result(1, "", "down")
+            return Result(0, "")
+
+        real_stderr = sys.stderr
+        stderr = io.StringIO()
+        patches = Patches()
+        try:
+            sys.stderr = stderr
+            self._patch_paths(patches, paths)
+            patches.set(pwd, "getpwnam", lambda name: Record())
+            patches.set(install.shutil, "which", which)
+            patches.set(install, "load_state", lambda path=None: None)
+            with self.assertRaises(AgentLockError) as caught:
+                install._darwin_apply(
+                    _args(), _owner(home), {"port": 7897, "source": "--port"}, [],
+                    stop_runner, io.StringIO())
+        finally:
+            sys.stderr = real_stderr
+            patches.restore()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("daemon", str(caught.exception))
+        claude_at = next(i for i, item in enumerate(calls) if item[:1] == ["claude"])
+        self.assertTrue(conf_loads(calls, claude_at))
+        self.assertTrue(anchor_loads(calls, claude_at))
+        self.assertFalse(any(item[:2] == ["pfctl", "-d"] for item in calls))
+        with open(paths["PF_CONF"], "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), original_pf)
+        with open(paths["ANCHOR_PATH"], "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old-anchor\n")
+        with open(settings, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), original_settings)
+
+        calls[:] = []
+        with open(paths["PF_CONF"], "w", encoding="utf-8") as handle:
+            handle.write(original_pf)
+        with open(paths["ANCHOR_PATH"], "w", encoding="utf-8") as handle:
+            handle.write("old-anchor\n")
+        stderr = io.StringIO()
+        patches = Patches()
+        try:
+            sys.stderr = stderr
+            self._patch_paths(patches, paths)
+            patches.set(pwd, "getpwnam", lambda name: Record())
+            patches.set(install.shutil, "which", which)
+            patches.set(install, "load_state", lambda path=None: None)
+            with self.assertRaises(AgentLockError) as caught:
+                install._darwin_apply(
+                    _args(), _owner(home), {"port": 7897, "source": "--port"}, [],
+                    proxy_runner, io.StringIO())
+        finally:
+            sys.stderr = real_stderr
+            patches.restore()
+        self.assertIn("proxy", str(caught.exception))
+        curl_at = next(i for i, item in enumerate(calls) if "curl" in item)
+        self.assertTrue(conf_loads(calls, curl_at))
+        self.assertTrue(anchor_loads(calls, curl_at))
+        self.assertFalse(any(item[:2] == ["pfctl", "-d"] for item in calls))
+        with open(paths["PF_CONF"], "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), original_pf)
+        with open(settings, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), original_settings)
+
+        calls[:] = []
+        with open(paths["PF_CONF"], "w", encoding="utf-8") as handle:
+            handle.write('anchor "agentlock"\n')
+        with open(paths["ANCHOR_PATH"], "w", encoding="utf-8") as handle:
+            handle.write("old-anchor\n")
+        stderr = io.StringIO()
+        patches = Patches()
+        try:
+            sys.stderr = stderr
+            self._patch_paths(patches, paths)
+            patches.set(pwd, "getpwnam", lambda name: Record())
+            patches.set(install.shutil, "which", which)
+            patches.set(install, "load_state", lambda path=None: None)
+            with self.assertRaises(AgentLockError):
+                install._darwin_apply(
+                    _args(), _owner(home), {"port": 7897, "source": "--port"}, [],
+                    proxy_runner, io.StringIO())
+        finally:
+            sys.stderr = real_stderr
+            patches.restore()
+        curl_at = next(i for i, item in enumerate(calls) if "curl" in item)
+        self.assertFalse(conf_loads(calls, curl_at))
+        self.assertTrue(anchor_loads(calls, curl_at))
+        self.assertFalse(any(item[:2] == ["pfctl", "-f"] for item in calls))
+
+
+class RereviewTest(unittest.TestCase):
+    def test_one_within_helper(self):
+        self.assertFalse(hasattr(install, "_under_home"))
+        self.assertFalse(hasattr(install, "_discovered_fields"))
+        from agent_lock import linux
+        self.assertFalse(hasattr(linux, "_is_same_or_under"))
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        home = os.path.join(root, "ownerhome")
+        leaf_dir = os.path.join(home, "proj", "bin")
+        os.makedirs(leaf_dir)
+        leaf = os.path.join(leaf_dir, "tool")
+        with open(leaf, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        parents = parent_dirs(leaf, home)
+        self.assertEqual(parents, [
+            os.path.abspath(home),
+            os.path.abspath(os.path.join(home, "proj")),
+            os.path.abspath(leaf_dir),
+        ])
+        self.assertNotIn(os.path.abspath(leaf), parents)
+        self.assertEqual(parent_dirs(home, home), [])
+        outside = os.path.join(root, "other", "tool")
+        os.makedirs(os.path.dirname(outside))
+        self.assertEqual(parent_dirs(outside, home), [])
+
+    def test_strip_settings_preserves_mode_and_owner(self):
+        import pwd
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        path = os.path.join(root, "settings.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"env": {"CLAUDE_CODE_PROCESS_WRAPPER": "w", "OTHER": "1"}, "keep": 1}\n')
+        os.chmod(path, 0o640)
+        calls = []
+        patches = Patches()
+        try:
+            patches.set(state.os, "geteuid", lambda: 0)
+            patches.set(install.os, "chown", lambda target, uid, gid: calls.append((target, uid, gid)))
+            _strip_settings([{"path": path, "created": False}], {"owner_uid": os.getuid()})
+            self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o640)
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn('"keep"', text)
+            self.assertIn("OTHER", text)
+            self.assertNotIn("CLAUDE_CODE_PROCESS_WRAPPER", text)
+            self.assertEqual(calls[-1][0], path)
+            self.assertEqual(calls[-1][1], os.getuid())
+            self.assertEqual(calls[-1][2], pwd.getpwuid(os.getuid()).pw_gid)
+            empty = os.path.join(root, "created.json")
+            with open(empty, "w", encoding="utf-8") as handle:
+                handle.write('{"env": {"CLAUDE_CODE_PROCESS_WRAPPER": "w"}}\n')
+            before = len(calls)
+            _strip_settings([{"path": empty, "created": True}], {"owner_uid": os.getuid()})
+            self.assertFalse(os.path.exists(empty))
+            self.assertEqual(len(calls), before)
+        finally:
+            patches.restore()
+
+    def test_rule_script_reads_the_security_filter(self):
+        script = windows_rule_script("S-1-5-21-9")
+        self.assertIn("Get-NetFirewallSecurityFilter", script)
+        self.assertNotIn("$_.LocalUser", script)
+        self.assertIn("Get-NetFirewallPortFilter", script)
+        self.assertIn("S-1-5-21-9", script)
+        with self.assertRaises(AgentLockError):
+            windows_rule_script("nope")
+
+    def test_numeric_outbound_action_exits_4(self):
+        self.assertIsNone(default_outbound_problem([{"DefaultOutboundAction": 2}]))
+        self.assertIsNone(default_outbound_problem([{"DefaultOutboundAction": "2"}]))
+        self.assertIsNone(default_outbound_problem([{"DefaultOutboundAction": "Allow"}]))
+        self.assertIsNone(default_outbound_problem([{"DefaultOutboundAction": True}]))
+        self.assertTrue(default_outbound_problem([{"name": "Private", "DefaultOutboundAction": 4}]))
+        self.assertTrue(default_outbound_problem([{"DefaultOutboundAction": "4"}]))
+        self.assertTrue(default_outbound_problem([{"DefaultOutboundAction": "Block"}]))
+        with self.assertRaises(Unsupported) as caught:
+            require_supported([{
+                "name": "Private", "AllowLocalFirewallRules": True, "DefaultOutboundAction": 4,
+            }])
+        self.assertEqual(caught.exception.code, 4)
+        with self.assertRaises(Unsupported) as caught:
+            require_supported([{
+                "name": "Private", "AllowLocalFirewallRules": 0, "DefaultOutboundAction": 2,
+            }])
+        self.assertEqual(caught.exception.code, 4)
+        require_supported([{
+            "name": "Private", "AllowLocalFirewallRules": True, "DefaultOutboundAction": "Allow",
+        }])
+        _gpo, outbound, ok, _extras = windows_firewall_report(
+            [{"name": "Private", "AllowLocalFirewallRules": True, "DefaultOutboundAction": 4}],
+            build_rules(7897, [], "S-1-5-21-1"), 7897)
+        self.assertTrue(outbound)
+        self.assertFalse(ok)
+        _checks, code = evaluate(_report(
+            platform="windows", outbound_problem=outbound, firewall_ok=True, extra_tcp_observed=[],
+        ))
+        self.assertEqual(code, 4)
+
+        def fake_run(argv, timeout=20):
+            blob = " ".join(str(part) for part in argv)
+            if "Get-NetFirewallProfile" in blob:
+                return Result(
+                    0, '{"Name":"Private","AllowLocalFirewallRules":1,"DefaultOutboundAction":4}')
+            if "Get-NetFirewallSecurityFilter" in blob:
+                self.assertNotIn("$_.LocalUser", blob)
+                return Result(0, "[]")
+            if "Get-Acl" in blob:
+                return Result(0, "BUILTIN\\Administrators\n")
+            return Result(1, "", "unexpected")
+
+        report = {}
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", fake_run)
+            doctor._fill_windows_firewall(report, {
+                "agent_sid": "S-1-5-21-1", "port": 7897, "wrapper": "agent-lock.cmd",
+            })
+        finally:
+            patches.restore()
+        self.assertTrue(report.get("outbound_problem"))
+        self.assertFalse(report.get("firewall_ok"))
+
+    def test_windows_account_facts(self):
+        text = windows_user_script()
+        self.assertIn("Get-LocalUser", text)
+        self.assertIn("Enabled", text)
+        self.assertNotIn("Administrators", text)
+
+        def run_with(user_out, admin_out):
+            def fake_run(argv, timeout=20):
+                blob = " ".join(str(part) for part in argv)
+                if "Get-LocalUser" in blob:
+                    return Result(0, user_out)
+                if "Administrators" in blob:
+                    return Result(0, admin_out)
+                return Result(1, "")
+
+            patches = Patches()
+            try:
+                patches.set(doctor, "_run", fake_run)
+                return doctor._account_facts({}, "windows")
+            finally:
+                patches.restore()
+
+        missing = run_with("", "no\n")
+        self.assertFalse(missing["exists"])
+        check = doctor._account_check({"account": missing}, "windows")
+        self.assertEqual(check["level"], "fail")
+        self.assertIn("does not exist", check["detail"])
+
+        disabled = run_with('{"Name":"agentnet","Enabled":false}', "no\n")
+        self.assertTrue(disabled["exists"])
+        self.assertFalse(disabled["enabled"])
+        check = doctor._account_check({"account": disabled}, "windows")
+        self.assertIn("disabled", check["detail"])
+
+        admin = run_with('{"Name":"agentnet","Enabled":true}', "yes\n")
+        self.assertEqual(admin["groups"], ["Administrators"])
+        check = doctor._account_check({"account": admin}, "windows")
+        self.assertIn("Administrators", check["detail"])
+
+        healthy = run_with('{"Name":"agentnet","Enabled":true}', "no\n")
+        check = doctor._account_check({"account": healthy}, "windows")
+        self.assertEqual(check["level"], "pass")
+
+    def test_windows_locked_probes_are_not_the_cmd(self):
+        import base64
+        sid = "S-1-5-21-1"
+        proxy = ["curl", "-sS", "-o", os.devnull, "--max-time", "5",
+                 "-x", "http://127.0.0.1:7897", "https://example.com"]
+        direct = ["curl", "-sS", "-o", os.devnull, "--max-time", "3",
+                  "--noproxy", "*", "https://1.1.1.1/"]
+        command = windows_locked_command(sid, "python", "probe.py", proxy, direct)
+        script = command[-1]
+        self.assertEqual(command[0], "powershell")
+        self.assertIn("Get-Credential", script)
+        self.assertIn("WindowsIdentity", script)
+        self.assertNotIn("agent-lock.cmd", script)
+        self.assertNotIn("exit 126", script)
+        self.assertNotIn("runas", script.lower())
+        with self.assertRaises(AgentLockError):
+            windows_locked_command("not-a-sid", "python", "probe.py", proxy, direct)
+
+        denied = base64.b64encode(b"agent-lock-probe: denied 1\n").decode("ascii")
+        empty = base64.b64encode(b"").decode("ascii")
+        batch = "\n".join([
+            "PROBE_CODE=1",
+            "PROBE_OUT_B64=" + denied,
+            "PROBE_ERR_B64=" + empty,
+            "PROXY_CODE=0",
+            "PROXY_ERR_B64=" + empty,
+            "NOPROXY_CODE=28",
+            "NOPROXY_ERR_B64=" + empty,
+        ])
+        parsed = parse_locked_batch(batch)
+        self.assertEqual(parsed["probe_code"], 1)
+        self.assertIn("denied", parsed["probe_stdout"])
+        self.assertEqual(parsed["noproxy_code"], 28)
+
+        calls = []
+
+        def fake_run(argv, timeout=20):
+            calls.append(list(argv))
+            if argv[:1] == ["powershell"]:
+                blob = " ".join(str(part) for part in argv)
+                self.assertNotIn("agent-lock.cmd", blob)
+                self.assertIn("Get-Credential", blob)
+                self.assertIn("WindowsIdentity", blob)
+                return Result(0, batch)
+            return Result(0, "agent-lock-probe: connected\n")
+
+        report = {}
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", fake_run)
+            doctor._fill_windows_probes(report, {"agent_sid": sid, "proxy": "http://127.0.0.1:7897"})
+        finally:
+            patches.restore()
+        self.assertEqual(report["probe_code"], 1)
+        self.assertEqual(report["proxy_code"], 0)
+        self.assertEqual(report["noproxy_code"], 28)
+        self.assertEqual(report["owner_probe_code"], 0)
+        self.assertIn("connected", report["owner_probe_stdout"])
+        self.assertEqual(calls[0][0], "powershell")
+        self.assertEqual(calls[1][1], "-c")
+        self.assertNotIn("powershell", calls[1][0])
+
+        calls[:] = []
+
+        def refused(argv, timeout=20):
+            calls.append(list(argv))
+            if argv[:1] == ["powershell"]:
+                return Result(126, "", "not agentnet")
+            return Result(0, "agent-lock-probe: connected\n")
+
+        report = {}
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", refused)
+            doctor._fill_windows_probes(report, {"agent_sid": sid, "proxy": "http://127.0.0.1:7897"})
+        finally:
+            patches.restore()
+        self.assertEqual(report["probe_code"], 126)
+        self.assertEqual(report["proxy_code"], 126)
+        self.assertEqual(report["noproxy_code"], 126)
+        self.assertFalse(doctor.probe_denied(
+            report.get("probe_stdout"), report.get("probe_stderr"), report["probe_code"]))
+        self.assertFalse(doctor.noproxy_locked(report["noproxy_code"], report.get("noproxy_stderr")))
+        level, detail = doctor._proxy_check(report)
+        self.assertEqual(level, "fail")
+        self.assertIn("126", detail)
+        self.assertEqual(report["owner_probe_code"], 0)
+
+        calls[:] = []
+        report = {}
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", fake_run)
+            doctor._fill_windows_probes(report, {"agent_sid": "bogus", "proxy": "http://127.0.0.1:7897"})
+        finally:
+            patches.restore()
+        self.assertEqual(report["probe_code"], 127)
+        self.assertEqual(report["owner_probe_code"], 0)
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(calls[0][0], "powershell")
+
+    def test_windows_exec_access_reads_the_agentnet_ace(self):
+        self.assertFalse(windows_path_executable(
+            "C:\\dir\\agentnet\\tool.exe NT AUTHORITY\\SYSTEM:(F)\n"))
+        self.assertFalse(windows_path_executable(
+            "C:\\dir\\agentnet\\tool.exe BUILTIN\\Users:(R)\n"))
+        self.assertFalse(windows_path_executable("MACHINE\\agentnet:(R)\n"))
+        self.assertTrue(windows_path_executable("MACHINE\\agentnet:(RX)\n"))
+        self.assertTrue(windows_path_executable("  MACHINE\\agentnet:(OI)(CI)(RX)\n"))
+        self.assertTrue(windows_path_executable("agentnet:(F)\n"))
+        self.assertTrue(windows_path_executable("agentnet:(M)\n"))
+
+        report = {}
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("empty exec list must not probe")
+
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", boom)
+            doctor._fill_claude(report, {"exec_paths": []}, "windows")
+        finally:
+            patches.restore()
+        self.assertTrue(report["exec_access_ok"])
+        self.assertIn("no recorded", report["exec_access_detail"])
+
+        calls = []
+
+        def ok_run(argv, timeout=20):
+            calls.append(list(argv))
+            return Result(0, "C:\\dir\\tool.exe MACHINE\\agentnet:(RX)\n")
+
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", ok_run)
+            doctor._fill_claude(report, {"exec_paths": ["C:\\dir\\tool.exe"]}, "windows")
+        finally:
+            patches.restore()
+        self.assertTrue(report["exec_access_ok"])
+        self.assertEqual(calls[0][0], "icacls")
+        self.assertNotIn("agent-lock.cmd", calls[0])
+
+        def bad_run(argv, timeout=20):
+            return Result(0, "C:\\dir\\agentnet\\tool.exe BUILTIN\\Users:(F)\n")
+
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", bad_run)
+            doctor._fill_claude(report, {"exec_paths": ["C:\\dir\\agentnet\\tool.exe"]}, "windows")
+        finally:
+            patches.restore()
+        self.assertFalse(report["exec_access_ok"])
+
+        def fail_run(argv, timeout=20):
+            return Result(1, "MACHINE\\agentnet:(RX)\n", "denied")
+
+        patches = Patches()
+        try:
+            patches.set(doctor, "_run", fail_run)
+            doctor._fill_claude(report, {"exec_paths": ["C:\\dir\\tool.exe"]}, "windows")
+        finally:
+            patches.restore()
+        self.assertFalse(report["exec_access_ok"])
+
+    def test_state_acl_failure_raises(self):
+        seen = []
+
+        def ok(argv):
+            seen.append(list(argv))
+            return Result(0)
+
+        apply_state_acl("state.json", "alice", runner=ok)
+        blob = " ".join(seen[0])
+        self.assertIn("*S-1-5-18:(F)", seen[0])
+        self.assertIn("*S-1-5-32-544:(F)", seen[0])
+        self.assertNotIn("Users", blob)
+        self.assertNotIn("agentnet", blob)
+        with self.assertRaises(AgentLockError):
+            apply_state_acl("state.json", "alice", runner=lambda argv: Result(1, "", "denied"))
+        with self.assertRaises(AgentLockError):
+            apply_state_acl("state.json", "alice", runner=lambda argv: None)
 
 
 if __name__ == "__main__":
