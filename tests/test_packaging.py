@@ -14,14 +14,14 @@ def read(rel):
 class PackagingTest(unittest.TestCase):
     def test_version_and_project_metadata(self):
         project = read("pyproject.toml")
-        self.assertIn('name = "agent-lock"', project)
+        self.assertIn('name = "agent-lock-cli"', project)
         self.assertIn('agent-lock = "agent_lock.cli:main"', project)
         self.assertIn('requires-python = ">=3.8"', project)
         self.assertIn("Changelog = ", project)
         self.assertIn("Issues = ", project)
-        self.assertIn('__version__ = "0.1.0"', read("src/agent_lock/__init__.py"))
+        self.assertIn('__version__ = "0.1.1"', read("src/agent_lock/__init__.py"))
         self.assertIn("Copyright (c) 2026 agent-lock contributors", read("LICENSE"))
-        self.assertIn("[0.1.0] - 2026-11-05", read("CHANGELOG.md"))
+        self.assertIn("[0.1.1] - 2026-11-05", read("CHANGELOG.md"))
 
     def test_release_workflow_uses_the_tag_env(self):
         text = read(".github/workflows/release.yml")
@@ -41,14 +41,14 @@ class PackagingTest(unittest.TestCase):
         self.assertIn("id-token: write", text)
         self.assertNotIn("PYPI_API_TOKEN", text)
         self.assertNotIn("password:", text)
-        self.assertIn("dist/agent_lock-${version}-py3-none-any.whl", text)
-        self.assertIn("dist/agent_lock-${version}.tar.gz", text)
+        self.assertIn("dist/agent_lock_cli-${version}-py3-none-any.whl", text)
+        self.assertIn("dist/agent_lock_cli-${version}.tar.gz", text)
 
     def test_readme_states_limits_and_completion(self):
         for name in ("README.md", "README.zh-CN.md"):
             text = read(name)
             self.assertIn("https://github.com/jakoes-wu/agent-lock", text, name)
-            self.assertIn("pipx install agent-lock", text, name)
+            self.assertIn("pipx install agent-lock-cli", text, name)
             self.assertIn("install.sh", text, name)
             self.assertIn(
                 "The checksum detects a corrupted download. "

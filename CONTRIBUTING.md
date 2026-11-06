@@ -47,10 +47,11 @@ A crash variable without test mode must not change a real install.
    the release. Until the assets are uploaded, installs are unverified.
    The checksum detects a corrupted download. It does not prove the GitHub
    account was not compromised.
-5. The `PyPI` workflow builds the package `agent-lock` and publishes it
+5. The `PyPI` workflow builds the package `agent-lock-cli` and publishes it
    through Trusted Publishing (environment `pypi`, no API token). Check that
-   `pipx install agent-lock` installs the new version. The wheel filename is
-   `agent_lock-<version>-py3-none-any.whl`.
+   `pipx install agent-lock-cli` installs the new version. The command remains
+   `agent-lock`. The wheel filename is
+   `agent_lock_cli-<version>-py3-none-any.whl`.
 6. After the first release asset exists, add the Homebrew formula in
    `jakoes-wu/homebrew-tap`: point `url` at `agent-lock-<tag>.tar.gz` and set
    `sha256` from `SHA256SUMS`.

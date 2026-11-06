@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-05
+
+### Changed
+
+- The PyPI distribution name is `agent-lock-cli`. The command remains `agent-lock`.
+  PyPI already publishes `agentlock`, and it treats `agent-lock` as that same name.
+
 ## [0.1.0] - 2026-11-05
 
 ### Added

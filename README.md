@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/jakoes-wu/agent-lock)](https://github.com/jakoes-wu/agent-lock/releases)
 [![CI](https://github.com/jakoes-wu/agent-lock/actions/workflows/ci.yml/badge.svg)](https://github.com/jakoes-wu/agent-lock/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/agent-lock)](https://pypi.org/project/agent-lock/)
+[![PyPI](https://img.shields.io/pypi/v/agent-lock-cli)](https://pypi.org/project/agent-lock-cli/)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/jakoes-wu/agent-lock/main/install.s
 
 The command is installed under `~/.local` (`--prefix` changes that). The installer prints a `PATH` hint and does not edit your shell profile.
 
-From PyPI: `pipx install agent-lock`. Use either pipx or `install.sh`, not both: they both provide an `agent-lock` command.
+From PyPI: `pipx install agent-lock-cli`. Use either pipx or `install.sh`, not both: they both provide an `agent-lock` command. The PyPI project is `agent-lock-cli` because `agentlock` is already published there.
 
 The Homebrew formula is added after the first release asset exists. Until then, use the installer or pipx.
 

@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/jakoes-wu/agent-lock)](https://github.com/jakoes-wu/agent-lock/releases)
 [![CI](https://github.com/jakoes-wu/agent-lock/actions/workflows/ci.yml/badge.svg)](https://github.com/jakoes-wu/agent-lock/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/agent-lock)](https://pypi.org/project/agent-lock/)
+[![PyPI](https://img.shields.io/pypi/v/agent-lock-cli)](https://pypi.org/project/agent-lock-cli/)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/jakoes-wu/agent-lock/main/install.s
 
 命令装在 `~/.local`（可用 `--prefix` 换位置）。安装脚本只打印 `PATH` 提示，不改你的 shell 配置。
 
-也可以从 PyPI 安装：`pipx install agent-lock`。`pipx` 和 `install.sh` 二选一，它们都会提供 `agent-lock` 命令。
+也可以从 PyPI 安装：`pipx install agent-lock-cli`。`pipx` 和 `install.sh` 二选一，它们都会提供 `agent-lock` 命令。PyPI 上的项目名是 `agent-lock-cli`，因为 `agentlock` 已经被占用。
 
 Homebrew 公式会在第一个 release 附件存在之后再加上。在那之前用安装脚本或 pipx。
 

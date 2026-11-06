@@ -78,7 +78,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(second.stdout.count("unchanged"), 2, second.stdout)
         self.assertEqual(self.tool("--version").returncode, 0)
-        self.assertIn("0.1.0", self.tool("--version").stdout)
+        self.assertIn("0.1.1", self.tool("--version").stdout)
 
     def test_version_manager_shim_is_resolved(self):
         shims = os.path.join(self.tmp, "pyenv", "shims")

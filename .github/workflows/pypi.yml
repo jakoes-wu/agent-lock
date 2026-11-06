@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish, e.g. v0.1.0"
+        description: "Tag to publish, e.g. v0.1.1"
         required: true
 
 permissions:
@@ -34,11 +34,11 @@ jobs:
           twine check --strict dist/*
           ls -l dist
       - name: Check the version
-        # The wheel filename follows the normalized project name agent-lock.
+        # The wheel filename follows the normalized project name agent-lock-cli.
         run: |
           version="${TAG#v}"
-          test -f "dist/agent_lock-${version}-py3-none-any.whl" || { echo "no wheel for ${version} in dist/"; exit 1; }
-          test -f "dist/agent_lock-${version}.tar.gz" || { echo "no sdist for ${version} in dist/"; exit 1; }
+          test -f "dist/agent_lock_cli-${version}-py3-none-any.whl" || { echo "no wheel for ${version} in dist/"; exit 1; }
+          test -f "dist/agent_lock_cli-${version}.tar.gz" || { echo "no sdist for ${version} in dist/"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: dist

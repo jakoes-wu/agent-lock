@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-lock"
+name = "agent-lock-cli"
 dynamic = ["version"]
 description = "Lock agent commands to the local HTTP proxy by running them as the user agentnet."
 readme = "README.md"
