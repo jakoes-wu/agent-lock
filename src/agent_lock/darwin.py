@@ -115,9 +115,6 @@ def patch_pf_conf(text):
     A pass quick rule before the block is a refusal, not a reason to append.
     """
     lines = _lines(text)
-    if text and not text.endswith("\n"):
-        # splitlines(keepends) already dropped a missing final newline.
-        pass
     span = _marker_span(lines)
     block_lines = _lines(anchor_block())
     if span is None:
@@ -155,10 +152,8 @@ def unpatch_pf_conf(text):
     return _join(lines[:begin] + lines[end + 1:])
 
 
-def user_plan(exists):
-    """Skip sysadminctl when the account already exists. Password is not an argument."""
-    if exists:
-        return []
+def user_plan():
+    """Commands that create the account. The caller skips them when it already exists."""
     return [
         [
             "sysadminctl", "-addUser", AGENT_USER, "-fullName", AGENT_USER,
@@ -183,12 +178,12 @@ def is_tcc_path(path, home):
     return False
 
 
-def acl_commands(directories, owner_home, home_needs_execute):
+def acl_commands(directories, owner_home):
     """NFSv4 ACL. -a then +a keeps a single entry. No launcher chown."""
-    commands = []
-    if home_needs_execute:
-        commands.append(["chmod", "-a", HOME_ACL_ENTRY, owner_home])
-        commands.append(["chmod", "+a", HOME_ACL_ENTRY, owner_home])
+    commands = [
+        ["chmod", "-a", HOME_ACL_ENTRY, owner_home],
+        ["chmod", "+a", HOME_ACL_ENTRY, owner_home],
+    ]
     for directory in directories:
         commands.append(["chmod", "-a", ACL_ENTRY, directory])
         commands.append(["chmod", "+a", ACL_ENTRY, directory])
@@ -229,3 +224,53 @@ def load_conf_argv(path=PF_CONF):
 
 def load_anchor_argv(path=ANCHOR_PATH):
     return ["pfctl", "-a", ANCHOR_NAME, "-f", path]
+
+
+PF_DYNAMIC_ANCHOR_WARNING = (
+    "warning: pfctl -f drops anchors that were inserted after the ruleset was parsed\n"
+)
+
+
+def pf_conf_problem(text):
+    """None when the marker is before the Apple anchor, or at the start if it is absent."""
+    try:
+        lines = _lines(text or "")
+        span = _marker_span(lines)
+    except PfRefuse as exc:
+        return str(exc)
+    if span is None:
+        return "pf.conf has no agent-lock anchor"
+    if _pass_quick_before(lines, span[0]):
+        return "a pass quick rule is before the agent-lock anchor"
+    apple = _apple_index(lines)
+    if apple is not None and span[0] > apple:
+        return 'agent-lock anchor is not before anchor "com.apple/*"'
+    return None
+
+
+def anchor_observed(text, port):
+    """(main v4 and v6 passes plus a block, extra host:port allows)."""
+    import re
+    port = int(port)
+    has_v4 = False
+    has_v6 = False
+    has_block = False
+    extras = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("block "):
+            has_block = True
+        match = re.search(r"\bto (127\.0\.0\.1|::1) port (\d+)\b", stripped)
+        if not match or not stripped.startswith("pass "):
+            continue
+        host = match.group(1)
+        found = int(match.group(2))
+        if found == port and host == "127.0.0.1":
+            has_v4 = True
+        elif found == port and host == "::1":
+            has_v6 = True
+        elif found != port:
+            value = "{}:{}".format(host, found)
+            if value not in extras:
+                extras.append(value)
+    return has_v4 and has_v6 and has_block, extras

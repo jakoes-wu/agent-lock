@@ -1,10 +1,10 @@
 """Linux nftables table, systemd oneshot, setfacl, and the agentnet user.
 
-Subprocess calls that change the machine go through `run`, which tests replace.
-Nothing here loads a ruleset unless `load_nft` is called.
+Nothing here loads a ruleset unless the caller runs nft.
 """
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -17,18 +17,6 @@ UNIT_PATH = "/etc/systemd/system/agent-lock-nft.service"
 UNIT_NAME = "agent-lock-nft.service"
 TABLE = "inet agentlock"
 NOLOGIN = "/usr/sbin/nologin"
-
-
-def run(argv, check=False, input_text=None, timeout=30):
-    return subprocess.run(
-        argv,
-        input=input_text,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-        timeout=timeout,
-        check=check,
-    )
 
 
 def render_nft(uid, port, extra_tcp):
@@ -102,7 +90,7 @@ ExecStop=-{nft} delete table inet agentlock
 
 [Install]
 WantedBy=multi-user.target
-""".format(nft=nft_bin, conf=conf_path)
+""".format(nft=shlex.quote(nft_bin), conf=shlex.quote(conf_path))
 
 
 def bind_bin_mode(old):
@@ -157,8 +145,7 @@ def _useradd(home_exists, group):
     return command
 
 
-def firewalld_is_active(runner=None):
-    runner = runner or run
+def firewalld_is_active(runner):
     try:
         result = runner(["systemctl", "is-active", "firewalld.service"])
     except (OSError, subprocess.SubprocessError):
@@ -168,18 +155,32 @@ def firewalld_is_active(runner=None):
     return code == 0 and stdout.strip() == "active"
 
 
-def require_firewalld_inactive(runner=None):
+def require_firewalld_inactive(runner):
     if firewalld_is_active(runner):
         raise Unsupported(
             "firewalld is active; agent-lock does not install while firewalld would drop the table")
 
 
+def accepted_system_tool(path):
+    """Absolute canonical path under /usr or /bin. Rejects shell metacharacters."""
+    if not path or not os.path.isabs(path):
+        return None
+    if any(char in path for char in "\n\r\t ;&|$`'\"<>\\"):
+        return None
+    real = os.path.realpath(path)
+    if not (real.startswith("/usr/") or real.startswith("/bin/")):
+        return None
+    if any(char in real for char in "\n\r\t ;&|$`'\"<>"):
+        return None
+    return real
+
+
 def find_nft():
-    return shutil.which("nft")
+    return accepted_system_tool(shutil.which("nft") or "")
 
 
 def find_runuser():
-    return shutil.which("runuser")
+    return accepted_system_tool(shutil.which("runuser") or "")
 
 
 def nft_check_argv(nft_bin, conf_path):
@@ -188,6 +189,72 @@ def nft_check_argv(nft_bin, conf_path):
 
 def nft_load_argv(nft_bin, conf_path):
     return [nft_bin, "-f", conf_path]
+
+
+def _rule_match(rule):
+    """Return (verdict, daddrs, dports) from one nft JSON rule."""
+    verdict = None
+    daddrs = []
+    dports = []
+    for item in rule.get("expr") or []:
+        if not isinstance(item, dict):
+            continue
+        if "accept" in item:
+            verdict = "accept"
+        elif "drop" in item:
+            verdict = "drop"
+        match = item.get("match")
+        if not isinstance(match, dict):
+            continue
+        left = match.get("left") if isinstance(match.get("left"), dict) else {}
+        payload = left.get("payload") if isinstance(left.get("payload"), dict) else None
+        if not payload:
+            continue
+        if payload.get("field") == "daddr":
+            daddrs.append(str(match.get("right")))
+        if payload.get("field") == "dport":
+            right = match.get("right")
+            if isinstance(right, bool):
+                continue
+            if isinstance(right, int):
+                dports.append(right)
+            elif isinstance(right, str) and right.isdigit():
+                dports.append(int(right))
+    return verdict, daddrs, dports
+
+
+def nft_observed(data, port):
+    """(main accepts and a drop are present, extra loopback allows).
+
+    `data` is the object from `nft -j list table`. Extras are host:port strings
+    other than the mixed port. An empty list means no extra accept was loaded.
+    """
+    port = int(port)
+    has_v4 = False
+    has_v6 = False
+    has_drop = False
+    extras = []
+    items = data.get("nftables") if isinstance(data, dict) else None
+    for item in items or []:
+        rule = item.get("rule") if isinstance(item, dict) else None
+        if not isinstance(rule, dict):
+            continue
+        verdict, daddrs, dports = _rule_match(rule)
+        if verdict == "drop":
+            has_drop = True
+        if verdict != "accept":
+            continue
+        for dport in dports:
+            for daddr in daddrs:
+                if daddr == "127.0.0.1" and dport == port:
+                    has_v4 = True
+                elif daddr == "::1" and dport == port:
+                    has_v6 = True
+                elif daddr in ("127.0.0.1", "::1") and dport != port:
+                    value = "{}:{}".format(daddr, dport)
+                    if value not in extras:
+                        extras.append(value)
+    return has_v4 and has_v6 and has_drop, extras
 
 
 def parent_dirs(path, owner_home):
@@ -209,10 +276,10 @@ def parent_dirs(path, owner_home):
 def _is_same_or_under(path, root):
     path = os.path.abspath(path)
     root = os.path.abspath(root)
-    if path == root:
-        return True
-    prefix = root.rstrip(os.sep) + os.sep
-    return path.startswith(prefix)
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
 
 
 def setfacl_commands(entries):
@@ -227,7 +294,7 @@ def setfacl_commands(entries):
             spec = "u:{user}:--x,m::--x".format(user=AGENT_USER)
         else:
             raise AgentLockError("unknown setfacl kind")
-        commands.append(["setfacl", "-m", spec, path])
+        commands.append(["setfacl", "-h", "-m", spec, path])
     return commands
 
 

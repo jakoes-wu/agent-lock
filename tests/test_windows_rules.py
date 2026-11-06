@@ -63,11 +63,14 @@ class WindowsRuleTest(unittest.TestCase):
         self.assertIn("S-1-5-21-9", script)
         self.assertNotIn("mklink", script)
         self.assertRaises(Exception, create_profile_script, "S-1-5-21-9'; calc")
-        blocked = link_plan(False, [("C:\\Users\\agentnet\\.codex", "C:\\owner\\.codex")])
-        self.assertIn("fail-profile", blocked)
-        self.assertFalse(any(step.startswith("mklink") for step in blocked))
-        ready = link_plan(True, [("C:\\Users\\agentnet\\.codex", "C:\\owner\\.codex")])
-        self.assertLess(ready.index("CreateProfile"), ready.index("mklink /J C:\\Users\\agentnet\\.codex C:\\owner\\.codex"))
+        ready = link_plan([("C:\\Users\\agentnet\\.codex", "C:\\owner\\.codex")])
+        self.assertEqual(
+            ready,
+            [["cmd", "/c", "mklink", "/J", "C:\\Users\\agentnet\\.codex", "C:\\owner\\.codex"]],
+        )
+        tricky = link_plan([("C:\\Users\\a&b\\.codex", "C:\\owner\\.codex")])
+        self.assertEqual(tricky[0][4], "C:\\Users\\a&b\\.codex")
+        self.assertNotIn("&", tricky[0][2])
 
     def test_uninstall_deletes_only_stored_names(self):
         names = ["agent-lock-lo-udp", "agent-lock-v4-below-loopback"]

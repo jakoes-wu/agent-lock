@@ -90,10 +90,6 @@ def interpret_response(status, body, secret):
         data = json.loads(text)
     except ValueError:
         raise DiscoverFailure("controller did not return JSON", secret=secret)
-    if secret and isinstance(body, str) and secret in body:
-        # Parsed data may contain the secret echoed by a broken controller.
-        # Callers must not log `data` verbatim. Port selection does not.
-        pass
     return data
 
 
@@ -174,8 +170,37 @@ class Candidate(object):
         self.kind = kind  # tcp, unix, pipe
 
 
-def collect_candidates(argv_list, read_text, owner_home, mihomo_home, verge_paths):
-    """Ordered candidates. Unix and pipes carry no secret into state."""
+def config_owned_by_installer(path, owner_home, owner_uid):
+    """True when the installing user owns the config. stat follows links.
+
+    A user-owned symlink to a root-owned file is rejected. Windows has no
+    trustworthy uid here, so the real path has to stay under the owner home.
+    """
+    if not path or not os.path.isabs(path):
+        return False
+    if sys.platform == "win32":
+        if not owner_home:
+            return False
+        try:
+            real = os.path.realpath(path)
+            home = os.path.realpath(owner_home)
+            return os.path.commonpath([real, home]) == home
+        except (OSError, ValueError):
+            return False
+    if owner_uid is None:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return int(st.st_uid) == int(owner_uid)
+
+
+def collect_candidates(argv_list, read_text, owner_home, mihomo_home, verge_paths, owner_uid=None):
+    """Ordered candidates. TCP comes only from a config the installer owns.
+
+    Process -ext-ctl addresses are not probed. Unix and pipe flags carry no secret.
+    """
     found = []
     seen = set()
 
@@ -198,27 +223,19 @@ def collect_candidates(argv_list, read_text, owner_home, mihomo_home, verge_path
         home = flags.get("d")
         if home is not None and not os.path.isabs(home):
             home = None
-        flag_secret = flags.get("secret")
-        file_secret = ""
         config_path = None
         if "f" in flags and os.path.isabs(flags["f"]):
             config_path = flags["f"]
         elif home is not None:
             config_path = os.path.join(home, "config.yaml")
-        if config_path:
-            file_secret = _collect_config(add, config_path, home, flag_secret, source + " config", read_text)
+        if config_path and config_owned_by_installer(config_path, owner_home, owner_uid):
+            _collect_config(add, config_path, home, None, source + " config", read_text)
         if "ext-ctl-unix" in flags:
             _add_unix(add, flags["ext-ctl-unix"], home, source)
         if "ext-ctl-pipe" in flags:
             add(Candidate(flags["ext-ctl-pipe"], "", source, "pipe"))
-        if "ext-ctl" in flags:
-            secret = flag_secret if flag_secret is not None else file_secret
-            parsed = normalize_tcp(flags["ext-ctl"])
-            if parsed:
-                _display, host, port = parsed
-                add(Candidate(_tcp_address(host, port), secret, source, "tcp"))
     for path in verge_paths or []:
-        if read_text(path) is not None:
+        if config_owned_by_installer(path, owner_home, owner_uid):
             _collect_config(add, path, os.path.dirname(path), None, "config " + path, read_text)
     if mihomo_home:
         sock = os.path.join(mihomo_home, "mihomo.sock")
@@ -337,7 +354,10 @@ def select_port(data, controller_address):
 
 
 def probe_candidate(candidate, fetch):
-    """fetch(address, secret) -> (status, body). Errors do not include the secret."""
+    """fetch(address, secret) -> (status, body). Errors do not include the secret.
+
+    A broken controller may echo the secret inside parsed JSON. Do not log `data`.
+    """
     secret = candidate.secret if candidate.kind == "tcp" else ""
     try:
         status, body = fetch(candidate.address, secret)

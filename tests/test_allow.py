@@ -8,7 +8,7 @@ import support
 
 from agent_lock.allow import parse_allow_tcp_value
 from agent_lock.cli import main
-from agent_lock.state import apply_install_fields, extra_tcp_from_args
+from agent_lock.state import apply_install_fields
 
 support.install = None
 
@@ -27,10 +27,8 @@ class AllowTest(unittest.TestCase):
             self.assertEqual(code, 2, value)
 
     def test_omitted_flag_clears(self):
-        self.assertEqual(extra_tcp_from_args(None), [])
-        self.assertEqual(extra_tcp_from_args([]), [])
         old = {"version": 1, "extra_tcp": ["127.0.0.1:9"], "port": 1, "secret": "keep"}
-        updated = apply_install_fields(old, 7897, extra_tcp_from_args(None), None, None)
+        updated = apply_install_fields(old, 7897, list(None or []), None, None)
         self.assertEqual(updated["extra_tcp"], [])
         self.assertEqual(updated["port"], 7897)
         self.assertEqual(updated["secret"], "keep")

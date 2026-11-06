@@ -12,7 +12,7 @@ import sys
 
 from .errors import AgentLockError
 from .darwin import acl_commands
-from .state import LINUX_AGENT_HOME, load_state, secret_label
+from .state import CREDENTIAL_DIRS, LINUX_AGENT_HOME, load_state, secret_label
 from .wrapper import CLAUDE_WRAPPER_PATH
 
 MIN_CLAUDE = (2, 1, 208)
@@ -147,6 +147,8 @@ def wrapper_problems(text, port, claude_text, darwin=False):
         problems.append("switcher port does not match state")
     if "export IFS" in text:
         problems.append("switcher exports IFS")
+    printf_at = text.find("IFS=$(/usr/bin/printf ' \\t\\n.')")
+    strip_at = text.find("IFS=${IFS%.}")
     if "unset IFS" not in text:
         problems.append("switcher does not unset IFS after the loader loop")
     if "sudo -n -l" not in text:
@@ -167,6 +169,8 @@ def wrapper_problems(text, port, claude_text, darwin=False):
     root_at = text.find(marker)
     if unset_at < 0 or root_at < 0 or root_at < unset_at:
         problems.append("root branch does not drop privileges after stripping loader variables")
+    if printf_at < 0 or strip_at < 0 or root_at < 0 or printf_at > root_at or strip_at > root_at:
+        problems.append("root branch does not set IFS from printf before exec")
     for line in text.splitlines():
         if marker in line and line.strip().startswith("exec ") and '"$@"' in line and SWITCHER_MARK not in line:
             problems.append("root branch execs the user command")
@@ -299,7 +303,7 @@ def evaluate(report):
         checks.append(_check(
             "home-traverse", "warn",
             "warn: agentnet cannot traverse the owner home; credential ACLs are not enough"))
-    if report.get("exec_access_ok", True):
+    if report.get("exec_access_ok") is True:
         checks.append(_check("exec-access", "pass", report.get("exec_access_detail") or "recorded paths are executable"))
     else:
         checks.append(_check("exec-access", "fail", report.get("exec_access_detail") or "a recorded path is not executable"))
@@ -347,6 +351,21 @@ def _account_check(report, platform):
     return _check("user", "pass", "agentnet exists and is not an administrator")
 
 
+def switcher_mode_problem(uid, mode, platform, owner_name=""):
+    """Root (Administrators on Windows) and not group-writable. Missing mode fails."""
+    if mode is None:
+        return "switcher mode was not read"
+    if mode & stat.S_IWGRP:
+        return "switcher is group-writable"
+    if platform == "windows":
+        if "administrators" not in (owner_name or "").lower():
+            return "windows switcher is not owned by Administrators"
+        return None
+    if uid != 0:
+        return "switcher is not owned by root"
+    return None
+
+
 def _firewall_check(report, platform, port):
     if report.get("firewall_unsupported"):
         return _check("firewall", "unsupported", report.get("firewall_detail") or "firewall backend is unsupported")
@@ -354,7 +373,7 @@ def _firewall_check(report, platform, port):
         return _check("firewall", "fail", report.get("firewall_detail") or "firewall does not match state")
     extra = report.get("extra_tcp_observed")
     expected = report.get("state", {}).get("extra_tcp") or []
-    if extra is not None and sorted(extra) != sorted(expected):
+    if extra is None or sorted(extra) != sorted(expected):
         return _check("firewall", "fail", "extra loopback allows do not match state.extra_tcp")
     return _check("firewall", "pass", "firewall matches port {}".format(port))
 
@@ -366,6 +385,11 @@ def _wrapper_check(report, platform, port, state):
         problems = wrapper_problems(
             report.get("switcher_text"), port, report.get("claude_text"),
             darwin=(platform == "darwin"))
+    mode_problem = switcher_mode_problem(
+        report.get("switcher_uid"), report.get("switcher_mode"), platform,
+        report.get("switcher_owner") or "")
+    if mode_problem:
+        problems.append(mode_problem)
     if problems:
         return _check("wrapper", "fail", "; ".join(problems))
     return _check("wrapper", "pass", "wrappers match port {}".format(port))
@@ -503,7 +527,7 @@ def repair_plan(state, platform, classify):
     """setfacl or macOS ACL only. Does not chown launchers and does not change the port."""
     roots = list(state.get("share_dirs") or [])
     home = state.get("owner_home") or ""
-    for name in (".codex", ".cx", ".claude", ".cc"):
+    for name in CREDENTIAL_DIRS:
         path = os.path.join(home, name)
         if classify(path) != "missing":
             roots.append(path)
@@ -516,7 +540,7 @@ def repair_plan(state, platform, classify):
         for root in roots:
             if classify(root) == "dir":
                 directories.append(root)
-        return acl_commands(directories, home, True)
+        return acl_commands(directories, home)
     return []
 
 
@@ -562,9 +586,9 @@ def _repair(state, stdout, stderr):
     commands = repair_plan(state, platform, classify_path)
     for command in commands:
         if command and command[0] == "chmod" and command[1] == "-a":
-            _run(command, allow_fail=True)
+            _run(command)
         else:
-            result = _run(command, allow_fail=False)
+            result = _run(command)
             if result is not None and result.returncode != 0:
                 stderr.write("repair failed: {}\n".format(" ".join(command)))
                 return 1
@@ -582,15 +606,13 @@ def _platform():
     return "other"
 
 
-def _run(argv, allow_fail=False, timeout=20):
+def _run(argv, timeout=20):
     import subprocess
     try:
         return subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
-        if allow_fail:
-            return None
         return None
 
 
@@ -654,17 +676,34 @@ def build_report(state):
         "pf_after": None,
         "unix_socket": None,
         "home_traversable": False,
-        "exec_access_ok": True,
+        "exec_access_ok": False,
         "exec_access_detail": "",
-        "extra_tcp_observed": list(state.get("extra_tcp") or []),
+        "extra_tcp_observed": None,
         "gpo_problem": None,
         "outbound_problem": None,
+        "switcher_uid": None,
+        "switcher_mode": None,
+        "switcher_owner": "",
     }
+    uid, mode = _switcher_stat(state.get("wrapper"))
+    report["switcher_uid"] = uid
+    report["switcher_mode"] = mode
     if not report["installed"]:
         report["installed_detail"] = "switcher or account is missing"
         return report
     _fill_network(report, state, platform)
+    _fill_claude(report, state, platform)
     return report
+
+
+def _switcher_stat(path):
+    if not path:
+        return None, None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None, None
+    return st.st_uid, stat.S_IMODE(st.st_mode)
 
 
 def _switcher_present(state, platform):
@@ -673,10 +712,6 @@ def _switcher_present(state, platform):
         return False
     if platform == "windows" and path and not os.path.isfile(path):
         return False
-    return bool(report_account_exists_hint(state))
-
-
-def report_account_exists_hint(state):
     return bool(state.get("agent_user"))
 
 
@@ -714,7 +749,6 @@ def _account_facts(state, platform):
 
 def _bin_dir_facts(state):
     facts = []
-    gid = state.get("agent_gid") or 0
     for path in state.get("bin_dirs") or []:
         try:
             st = os.lstat(path)
@@ -726,9 +760,8 @@ def _bin_dir_facts(state):
             "is_dir": stat.S_ISDIR(st.st_mode),
             "is_link": stat.S_ISLNK(st.st_mode),
             "mode": stat.S_IMODE(st.st_mode),
-            "gid": st.st_gid if st.st_gid == gid or True else st.st_gid,
+            "gid": st.st_gid,
         })
-        facts[-1]["gid"] = st.st_gid
     return facts
 
 
@@ -767,7 +800,7 @@ def _fill_network(report, state, platform):
         parsed, count = _pf_block_count()
         report["pf_counter_parsed"] = parsed
         report["pf_before"] = count
-    if switcher and os.path.isfile(switcher) and platform != "windows":
+    if switcher and os.path.isfile(switcher):
         locked = _run([switcher] + probe, timeout=15)
         if locked:
             report["probe_code"] = locked.returncode
@@ -803,7 +836,7 @@ def _fill_network(report, state, platform):
     elif platform == "darwin":
         _fill_darwin_firewall(report, state)
     elif platform == "windows":
-        report["firewall_detail"] = "Windows firewall query needs PowerShell"
+        _fill_windows_firewall(report, state)
     _fill_controller(report, state)
     _fill_identity(report, state, platform)
     _fill_home(report, state, platform)
@@ -812,45 +845,115 @@ def _fill_network(report, state, platform):
 
 
 def _fill_linux_firewall(report, state):
+    from .linux import nft_observed
     nft = _which("nft")
     if not nft:
         report["firewall_unsupported"] = True
         report["firewall_detail"] = "nft is not installed"
+        report["extra_tcp_observed"] = None
         return
     result = _run(["sudo", nft, "-j", "list", "table", "inet", "agentlock"], timeout=20)
     if not result or result.returncode != 0:
         report["firewall_ok"] = False
         report["firewall_detail"] = "could not list table inet agentlock"
+        report["extra_tcp_observed"] = None
         return
     try:
         data = json.loads(result.stdout)
     except ValueError:
         report["firewall_detail"] = "nft JSON was not readable"
+        report["extra_tcp_observed"] = None
+        report["firewall_ok"] = False
         return
-    blob = json.dumps(data)
-    needed = ("agentlock_accept_v4", "agentlock_accept_v6", "agentlock_drop")
-    if all(name in blob for name in needed) and "drop" in blob and str(state.get("port")) in blob:
-        report["firewall_ok"] = True
-        report["firewall_detail"] = "nft table lists the named counters"
+    ok, extras = nft_observed(data, state.get("port") or 0)
+    report["extra_tcp_observed"] = extras
+    report["firewall_ok"] = bool(ok)
+    if ok:
+        report["firewall_detail"] = "nft table matches the saved port"
     else:
         report["firewall_detail"] = "nft table does not match the saved port"
 
 
 def _fill_darwin_firewall(report, state):
+    from .darwin import anchor_observed, pf_conf_problem
     text = _read("/etc/pf.conf")
-    if 'anchor "agentlock"' not in text:
-        report["firewall_detail"] = "pf.conf has no agent-lock anchor"
+    problem = pf_conf_problem(text)
+    if problem:
+        report["firewall_ok"] = False
+        report["firewall_detail"] = problem
+        report["extra_tcp_observed"] = None
         return
-    report["firewall_ok"] = 'anchor "com.apple/*"' in text
-    if not report["firewall_ok"]:
-        report["firewall_detail"] = 'anchor "com.apple/*" is missing'
+    result = _run(["sudo", "pfctl", "-a", "agentlock", "-sr"], timeout=20)
+    if not result or result.returncode != 0:
+        report["firewall_ok"] = False
+        report["firewall_detail"] = "could not read the agentlock anchor"
+        report["extra_tcp_observed"] = None
+        return
+    ok, extras = anchor_observed(result.stdout or "", state.get("port") or 0)
+    report["extra_tcp_observed"] = extras
+    report["firewall_ok"] = bool(ok)
+    if ok:
+        report["firewall_detail"] = "pf anchor passes the state port and blocks other traffic"
+    else:
+        report["firewall_detail"] = "pf anchor does not pass the state port and block other traffic"
+
+
+def _fill_windows_firewall(report, state):
+    from .windows import windows_firewall_report, windows_profile_script, windows_rule_script
+    profile = _run(["powershell", "-NoProfile", "-Command", windows_profile_script()], timeout=30)
+    if not profile or profile.returncode != 0 or not (profile.stdout or "").strip():
+        report["firewall_ok"] = False
+        report["firewall_detail"] = "could not query Windows firewall profiles"
+        report["extra_tcp_observed"] = None
+        return
+    sid = state.get("agent_sid") or ""
+    try:
+        rule_script = windows_rule_script(sid)
+    except AgentLockError as exc:
+        report["firewall_ok"] = False
+        report["firewall_detail"] = str(exc)
+        report["extra_tcp_observed"] = None
+        return
+    rules = _run(["powershell", "-NoProfile", "-Command", rule_script], timeout=30)
+    if not rules or rules.returncode != 0:
+        report["firewall_ok"] = False
+        report["firewall_detail"] = "could not query Windows firewall rules"
+        report["extra_tcp_observed"] = None
+        return
+    try:
+        profiles = json.loads(profile.stdout)
+        parsed_rules = json.loads(rules.stdout) if (rules.stdout or "").strip() else []
+    except ValueError:
+        report["firewall_ok"] = False
+        report["firewall_detail"] = "Windows firewall query was not JSON"
+        report["extra_tcp_observed"] = None
+        return
+    if isinstance(profiles, dict):
+        profiles = [profiles]
+    if isinstance(parsed_rules, dict):
+        parsed_rules = [parsed_rules]
+    gpo, outbound, ok, extras = windows_firewall_report(profiles, parsed_rules, state.get("port") or 0)
+    report["gpo_problem"] = gpo
+    report["outbound_problem"] = outbound
+    report["firewall_ok"] = bool(ok)
+    report["extra_tcp_observed"] = extras
+    if gpo or outbound:
+        report["firewall_detail"] = gpo or outbound
+    elif ok:
+        report["firewall_detail"] = "Windows firewall blocks this SID except the proxy port"
+    else:
+        report["firewall_detail"] = "Windows firewall does not match the saved port"
+    owner = _run(["powershell", "-NoProfile", "-Command",
+                  "(Get-Acl -LiteralPath '{}').Owner".format(state.get("wrapper") or "")], timeout=20)
+    if owner and owner.returncode == 0:
+        report["switcher_owner"] = (owner.stdout or "").strip()
 
 
 def _linux_drop_packets():
     nft = _which("nft")
     if not nft:
         return None
-    result = _run([nft, "-j", "list", "counter", "inet", "agentlock", "agentlock_drop"], timeout=15)
+    result = _run(["sudo", nft, "-j", "list", "counter", "inet", "agentlock", "agentlock_drop"], timeout=15)
     if not result or result.returncode != 0:
         return None
     try:
@@ -871,7 +974,7 @@ def _linux_drop_packets():
 
 def _pf_block_count():
     """(parsed, packets). Unparsed stays a warning in pf_counter_status."""
-    result = _run(["pfctl", "-a", "agentlock", "-sr", "-v"], timeout=15)
+    result = _run(["sudo", "pfctl", "-a", "agentlock", "-sr", "-v"], timeout=15)
     if not result or result.returncode != 0 or not result.stdout:
         return False, None
     packets = None
@@ -895,8 +998,8 @@ def _pf_block_count():
 def _fill_controller(report, state):
     address = state.get("controller") or ""
     if not address:
-        report["controller_error"] = None
-        report["controller_port"] = state.get("port")
+        report["controller_error"] = "no controller address is stored"
+        report["controller_port"] = None
         return
     from .discover import Candidate, default_fetch, discover
     kind = "unix" if str(address).startswith("unix:") else "tcp"
@@ -915,37 +1018,59 @@ def _fill_controller(report, state):
     report["allow_lan"] = False
 
 
+def identity_commands(switcher):
+    """One printenv per name so an unset variable stays unset instead of shifting lines."""
+    return [[switcher, "/usr/bin/printenv", name] for name in ("USER", "LOGNAME", "HOME")]
+
+
+def identity_expected(environ):
+    found = {}
+    for key, name in (("user", "USER"), ("logname", "LOGNAME"), ("home", "HOME")):
+        found[key] = environ[name] if name in environ else None
+    return found
+
+
+def identity_from_results(results):
+    """(returncode, stdout) per name. A non-zero status is an unset variable."""
+    if not results or any(item is None for item in results):
+        return None
+    seen = {}
+    for key, item in zip(("user", "logname", "home"), results):
+        code, stdout = item
+        if code != 0:
+            seen[key] = None
+        else:
+            lines = (stdout or "").splitlines()
+            seen[key] = lines[0] if lines else None
+    return seen
+
+
 def _fill_identity(report, state, platform):
     if platform == "windows":
         return
-    script = "printf '%s\\n' \"${USER-}\" \"${LOGNAME-}\" \"${HOME-}\""
-    _run(["sudo", "-k"], allow_fail=True)
-    if platform == "linux":
-        runuser = state.get("runuser_path") or ""
-        if not runuser:
-            return
-        result = _run([runuser, "-u", "agentnet", "--", "sh", "-c", script])
-    else:
-        result = _run(["sudo", "-n", "-u", "agentnet", "--", "sh", "-c", script])
-    if not result or result.returncode != 0:
+    report["expected_identity"] = identity_expected(os.environ)
+    _run(["sudo", "-k"])
+    switcher = state.get("wrapper") or ""
+    if not switcher or not os.path.isfile(switcher):
+        report["seen_identity"] = None
         return
-    lines = (result.stdout or "").splitlines()
-    if len(lines) < 3:
-        return
-    report["seen_identity"] = {"user": lines[0], "logname": lines[1], "home": lines[2]}
+    results = []
+    for command in identity_commands(switcher):
+        result = _run(command)
+        if result is None:
+            results.append(None)
+        else:
+            results.append((result.returncode, result.stdout))
+    report["seen_identity"] = identity_from_results(results)
 
 
 def _fill_home(report, state, platform):
     home = state.get("owner_home") or ""
-    if not home or platform == "windows":
+    switcher = state.get("wrapper") or ""
+    if not home or platform == "windows" or not switcher:
         report["home_traversable"] = False
         return
-    if platform == "linux" and state.get("runuser_path"):
-        result = _run([state["runuser_path"], "-u", "agentnet", "--", "test", "-x", home])
-    elif platform == "darwin":
-        result = _run(["sudo", "-n", "-u", "agentnet", "--", "test", "-x", home])
-    else:
-        result = None
+    result = _run([switcher, "test", "-x", home])
     report["home_traversable"] = bool(result and result.returncode == 0)
 
 
@@ -976,16 +1101,158 @@ def _fill_unix(report, state, platform):
         "sys.exit(0)\n"
     )
     python = sys.executable or "python3"
+    switcher = state.get("wrapper") or ""
     for path in existing:
-        if platform == "linux" and state.get("runuser_path"):
-            result = _run([state["runuser_path"], "-u", "agentnet", "--", python, "-c", code, path])
-        elif platform == "darwin":
-            result = _run(["sudo", "-n", "-u", "agentnet", "--", python, "-c", code, path])
-        else:
-            result = None
+        if not switcher:
+            return
+        result = _run([switcher, python, "-c", code, path])
         if result is None:
             return
         if result.returncode == 0:
             report["unix_socket"] = "open"
             return
     report["unix_socket"] = "closed"
+
+
+def classify_login(probe):
+    """probe keys: attempted, keychain_account, credentials_account, owner.
+
+    keychain_account is only set when the agentnet probe succeeded. The owner's
+    own keychain does not count.
+    """
+    if not probe or not probe.get("attempted"):
+        return "skip", "skipped: Claude login was not probed"
+    owner = probe.get("owner") or ""
+    if owner and probe.get("keychain_account") == owner:
+        return "pass", "agentnet keychain has the owner account"
+    if owner and probe.get("credentials_account") == owner:
+        return "pass", "agentnet can read a Claude credential for the owner"
+    return "fail", "agentnet cannot see a Claude login"
+
+
+def credentials_account(text, owner):
+    if not text or not owner:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key.lower() in ("account", "user", "email", "username") and isinstance(value, str):
+                    found.append(value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    if owner in found:
+        return owner
+    return None
+
+
+def classify_daemon(rows, agent_uid, service_file):
+    """Fail when a claude daemon is running as someone other than agentnet.
+
+    A service file warns only when no daemon process is running.
+    """
+    owner_running = False
+    agent_running = False
+    for uid, command in rows or []:
+        text = command or ""
+        if "claude-daemon" not in text and "com.anthropic.claude-daemon" not in text:
+            continue
+        if agent_uid and int(uid) == int(agent_uid):
+            agent_running = True
+        else:
+            owner_running = True
+    if owner_running:
+        return True, False
+    if service_file and not agent_running:
+        return False, True
+    return False, False
+
+
+def parse_ps_uid_command(text):
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        uid, _sep, command = line.partition(" ")
+        if uid.isdigit():
+            rows.append((int(uid), command.strip()))
+    return rows
+
+
+def exec_access_problem(codes):
+    if any(code != 0 for code in codes):
+        return "a recorded path is not executable"
+    return None
+
+
+def daemon_service_paths(home):
+    home = home or ""
+    return [
+        os.path.join(home, "Library", "LaunchAgents", "com.anthropic.claude-daemon.plist"),
+        os.path.join(home, ".config", "systemd", "user", "claude-daemon.service"),
+    ]
+
+
+def _fill_claude(report, state, platform):
+    if platform == "windows":
+        report["exec_access_ok"] = not state.get("exec_paths")
+        return
+    switcher = state.get("wrapper") or ""
+    owner = state.get("owner") or ""
+    home = state.get("owner_home") or ""
+    cred_path = os.path.join(home, ".claude", ".credentials.json") if home else ""
+    probe = {"attempted": False, "owner": owner, "keychain_account": None, "credentials_account": None}
+    if switcher and os.path.isfile(switcher):
+        probe["attempted"] = True
+        if platform == "darwin" and owner:
+            keychain = _run([
+                switcher, "security", "find-generic-password", "-a", owner, "-s", "Claude Code",
+            ])
+            if keychain and keychain.returncode == 0:
+                probe["keychain_account"] = owner
+        if cred_path:
+            cred = _run([switcher, "/bin/cat", cred_path])
+            if cred and cred.returncode == 0:
+                probe["credentials_account"] = credentials_account(cred.stdout, owner)
+    status, detail = classify_login(probe)
+    report["claude_login"] = status
+    report["claude_login_detail"] = detail
+    rows = []
+    ps = _run(["ps", "-ax", "-o", "uid=,command="])
+    if ps and ps.returncode == 0:
+        rows = parse_ps_uid_command(ps.stdout)
+    service = any(os.path.isfile(path) for path in daemon_service_paths(home))
+    running, service_only = classify_daemon(rows, state.get("agent_uid"), service)
+    report["daemon_running_as_owner"] = running
+    report["daemon_service_file"] = service_only
+    paths = []
+    launcher = state.get("claude_wrapper") or ""
+    if launcher:
+        paths.append(launcher)
+    paths.extend(state.get("exec_paths") or [])
+    if not paths:
+        report["exec_access_ok"] = True
+        report["exec_access_detail"] = "no recorded launchers"
+        return
+    if not switcher:
+        report["exec_access_ok"] = False
+        report["exec_access_detail"] = "a recorded path is not executable"
+        return
+    codes = []
+    for path in paths:
+        result = _run([switcher, "test", "-x", path])
+        codes.append(1 if result is None else result.returncode)
+    problem = exec_access_problem(codes)
+    report["exec_access_ok"] = problem is None
+    report["exec_access_detail"] = problem or "recorded paths are executable"

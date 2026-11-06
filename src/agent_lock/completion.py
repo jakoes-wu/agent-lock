@@ -37,8 +37,9 @@ def command_spec(parser):
 
 
 def _positional_choices(parser):
-    """{(command, index): [words]} for positionals that declare choices."""
+    """Choice words, and bind-bin's path positional, from one subparser walk."""
     found = {}
+    files = []
     for action in parser._actions:  # noqa: SLF001
         if not isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
             continue
@@ -51,29 +52,11 @@ def _positional_choices(parser):
                     continue
                 if sub_action.choices and sub_action.nargs in (None, "?"):
                     found[(name, index)] = [str(choice) for choice in sub_action.choices]
+                elif not sub_action.choices and name == "bind-bin" and index == 0:
+                    files.append((name, index))
                 if sub_action.nargs != "*":
                     index += 1
-    return found
-
-
-def _file_positions(parser):
-    """Positionals that complete as paths. bind-bin's path is the only one."""
-    found = []
-    for action in parser._actions:  # noqa: SLF001
-        if not isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
-            continue
-        for name, sub in action.choices.items():
-            index = 0
-            for sub_action in sub._actions:  # noqa: SLF001
-                if sub_action.option_strings or sub_action.help == argparse.SUPPRESS:
-                    continue
-                if isinstance(sub_action, argparse._HelpAction):  # noqa: SLF001
-                    continue
-                if not sub_action.choices and name == "bind-bin" and index == 0:
-                    found.append((name, index))
-                if sub_action.nargs != "*":
-                    index += 1
-    return found
+    return found, files
 
 
 def _path_options(spec):
@@ -96,8 +79,7 @@ def _no_file_options(spec):
 
 def script(shell, parser):
     spec = command_spec(parser)
-    choices = _positional_choices(parser)
-    files = _file_positions(parser)
+    choices, files = _positional_choices(parser)
     if shell == "bash":
         return _bash(spec, choices, files)
     if shell == "zsh":

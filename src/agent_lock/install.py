@@ -42,6 +42,7 @@ from .darwin import (
     ANCHOR_PATH,
     PF_BACKUP,
     PF_CONF,
+    PF_DYNAMIC_ANCHOR_WARNING,
     acl_commands,
     check_conf_argv,
     enable_argv,
@@ -58,6 +59,7 @@ from .darwin import (
 from .state import (
     AGENT_USER,
     CLAUDE_WRAPPER_PATH,
+    CREDENTIAL_DIRS,
     LINUX_AGENT_HOME,
     SUDOERS_PATH,
     SWITCHER_PATH,
@@ -65,7 +67,6 @@ from .state import (
     apply_install_fields,
     atomic_write,
     config_base,
-    extra_tcp_from_args,
     is_root,
     load_state,
     merge_claude_settings,
@@ -84,9 +85,11 @@ from .windows import (
     render_rule_script,
     require_supported,
     rule_names,
+    rule_phases,
     share_icacls,
     uninstall_commands,
     user_action,
+    windows_admin_script,
 )
 from .wrapper import render_claude, render_sudoers, render_switcher, render_windows_cmd
 from .linux import bind_bin_mode, validate_bind_bin
@@ -104,10 +107,17 @@ def _runner(argv, check=False, input_text=None, timeout=60):
     )
 
 
-def _ok(runner, argv, input_text=None):
+def _ok(runner, argv, input_text=None, unsupported=False):
     result = runner(argv, input_text=input_text)
     if getattr(result, "returncode", 1) != 0:
         detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+        if unsupported:
+            base = os.path.basename(str(argv[0]))
+            if base == "nft":
+                raise Unsupported(
+                    "nft must understand destroy and named counters: {}".format(
+                        detail or "syntax check failed"))
+            raise Unsupported("pf syntax check failed: {}".format(detail or "pfctl -nf failed"))
         raise AgentLockError("{} failed: {}".format(argv[0], detail or "exit {}".format(
             getattr(result, "returncode", 1))))
     return result
@@ -129,6 +139,54 @@ def _expand(path, owner_home):
     if os.path.isabs(path):
         return path
     return os.path.abspath(path)
+
+
+def _under_home(path, home):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(home)]) == os.path.abspath(home)
+    except ValueError:
+        return False
+
+
+def _confine(path, owner_home, kind):
+    """realpath under the installing user's home. Symlinks and .. escapes are refused."""
+    expanded = _expand(path, owner_home)
+    if os.path.lexists(expanded) and os.path.islink(expanded):
+        raise UsageError("refusing a symlink: {}".format(path))
+    real = os.path.realpath(expanded)
+    home = os.path.realpath(owner_home)
+    if not _under_home(real, home):
+        raise UsageError("path is outside the installing user's home: {}".format(path))
+    if kind == "share" and os.path.normcase(os.path.normpath(real)) == os.path.normcase(os.path.normpath(home)):
+        raise UsageError("refusing to share the home directory")
+    if sys.platform == "darwin" and is_tcc_path(real, home):
+        raise UsageError("path is in Desktop, Documents, or Downloads: {}".format(path))
+    return real
+
+
+def _claude_dirname_ok(directory):
+    name = os.path.basename(os.path.normpath(directory))
+    return name == ".claude" or name.endswith(".claude")
+
+
+def _discovered_fields(found):
+    """A --port fallback keeps the stored controller and secret."""
+    if not found or found.get("source") == "--port":
+        return None, None
+    controller = found.get("controller")
+    secret = found.get("secret")
+    if controller is None:
+        controller = ""
+    if secret is None:
+        secret = ""
+    return controller, secret
+
+
+def _state_after_install(old, owner, port, extra, found):
+    controller, secret = _discovered_fields(found)
+    if not old:
+        return new_state(owner, port, controller or "", secret or "", extra)
+    return apply_install_fields(old, port, extra, controller, secret)
 
 
 def _owner_env(owner):
@@ -189,18 +247,15 @@ def _gather(args, owner, runner):
             owner.get("home"),
             mihomo_home(owner.get("home"), env),
             verge_paths(owner.get("home"), appdata),
+            owner.get("uid"),
         )
-        if secret:
-            for candidate in candidates:
-                if candidate.kind == "tcp":
-                    candidate.secret = secret
     found = choose_port(args.port, bool(args.controller), candidates, default_fetch)
     return found
 
 
 def _credential_roots(owner_home, share_dirs):
     roots = []
-    for name in (".codex", ".cx", ".claude", ".cc"):
+    for name in CREDENTIAL_DIRS:
         path = os.path.join(owner_home, name)
         if classify_path(path) != "missing":
             roots.append(path)
@@ -233,28 +288,49 @@ def _account_dirs(owner):
     return paths
 
 
-def _write_settings(paths, wrapper):
+def _chown_installer(path, owner):
+    """Root's write is given back to the installing user. Not used for switcher or firewall files."""
+    if sys.platform == "win32" or not is_root() or not owner or not owner.get("uid"):
+        return
+    import pwd
+    try:
+        gid = pwd.getpwuid(int(owner["uid"])).pw_gid
+    except KeyError:
+        return
+    os.chown(path, int(owner["uid"]), gid)
+
+
+def _write_settings(paths, wrapper, owner):
     """POSIX only. Records {path, created}. Does not write proxy variables."""
     written = []
     for path in paths:
         directory = os.path.dirname(path)
-        if directory and not os.path.isdir(directory):
-            if os.path.basename(directory) == ".claude" or path.endswith(os.path.join(".claude", "settings.json")):
-                os.makedirs(directory, exist_ok=True)
-            else:
-                continue
-        created = not os.path.exists(path)
+        if not directory or not _claude_dirname_ok(directory):
+            continue
+        if os.path.islink(directory):
+            raise AgentLockError("refusing a symlinked settings directory: {}".format(directory))
+        created_dir = False
+        if not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+            created_dir = True
+        if os.path.islink(path):
+            raise AgentLockError("refusing to follow a symlinked settings file: {}".format(path))
+        created = not os.path.isfile(path)
+        previous_mode = 0o600
         document = {}
-        if os.path.isfile(path) and not os.path.islink(path):
+        if os.path.isfile(path):
+            st = os.lstat(path)
+            previous_mode = stat.S_IMODE(st.st_mode)
             text = _read_text(path) or ""
             try:
                 document = json.loads(text) if text.strip() else {}
             except ValueError:
                 raise AgentLockError("cannot parse Claude settings: {}".format(path))
-        elif os.path.islink(path):
-            raise AgentLockError("refusing to follow a symlinked settings file: {}".format(path))
         document = merge_claude_settings(document, wrapper)
-        atomic_write(path, json.dumps(document, indent=2, sort_keys=True) + "\n", 0o600)
+        atomic_write(path, json.dumps(document, indent=2, sort_keys=True) + "\n", previous_mode)
+        _chown_installer(path, owner)
+        if created_dir:
+            _chown_installer(directory, owner)
         written.append({"path": path, "created": created})
     return written
 
@@ -265,19 +341,92 @@ def _snapshot(paths):
         try:
             st = os.lstat(path)
             with open(path, "rb") as handle:
-                saved.append((path, handle.read(), stat.S_IMODE(st.st_mode)))
+                saved.append((path, handle.read(), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid))
         except OSError:
-            saved.append((path, None, None))
+            saved.append((path, None, None, None, None))
     return saved
 
 
 def _restore(saved):
-    for path, data, mode in saved:
+    for item in saved:
+        path, data, mode = item[0], item[1], item[2]
+        uid = item[3] if len(item) > 3 else None
+        gid = item[4] if len(item) > 4 else None
         if data is None:
             if os.path.lexists(path) and not os.path.isdir(path):
                 os.remove(path)
             continue
         atomic_write(path, data, mode or 0o644)
+        if uid is not None and gid is not None and is_root():
+            try:
+                os.chown(path, uid, gid)
+            except OSError:
+                pass
+
+
+def _stop_claude_daemon(runner):
+    if shutil.which("claude") is None:
+        sys.stderr.write("warning: claude is not on PATH; skipped daemon stop\n")
+        return
+    result = runner(["claude", "daemon", "stop", "--any"])
+    if getattr(result, "returncode", 1) != 0:
+        raise AgentLockError("claude daemon stop failed", 1)
+
+
+def _share_paths(args, owner):
+    paths = []
+    for path in args.share_dir or []:
+        real = _confine(path, owner["home"], "share")
+        if not os.path.isdir(real) or os.path.islink(real):
+            raise UsageError("share-dir is not a directory: {}".format(path))
+        paths.append(real)
+    return paths
+
+
+def _trust_paths(args, owner):
+    paths = []
+    for path in args.trust_exec or []:
+        real = _confine(path, owner["home"], "trust")
+        if os.path.islink(real):
+            raise UsageError("refusing a symlink: {}".format(path))
+        paths.append(real)
+    return paths
+
+
+def _posix_settings_paths(args, owner):
+    paths = []
+    home_dir = os.path.join(owner["home"], ".claude")
+    if _claude_dirname_ok(home_dir):
+        paths.append(os.path.join(home_dir, "settings.json"))
+    for path in args.claude_dir or []:
+        directory = _confine(path, owner["home"], "claude")
+        if not _claude_dirname_ok(directory):
+            raise UsageError("claude-dir must be named .claude")
+        paths.append(os.path.join(directory, "settings.json"))
+    for path in _account_dirs(owner):
+        try:
+            directory = _confine(path, owner["home"], "claude")
+        except UsageError:
+            continue
+        if _claude_dirname_ok(directory):
+            paths.append(os.path.join(directory, "settings.json"))
+    return paths
+
+
+def _refuse_groups(runner, names, flag):
+    result = runner(["id", flag, AGENT_USER])
+    groups = (getattr(result, "stdout", "") or "").split()
+    for name in names:
+        if name in groups:
+            raise AgentLockError("agentnet is in the {} group".format(name))
+
+
+def _pf_reload(runner, path, strict):
+    sys.stderr.write(PF_DYNAMIC_ANCHOR_WARNING)
+    if strict:
+        _ok(runner, load_conf_argv(path))
+    else:
+        runner(load_conf_argv(path))
 
 
 def _linux_identity():
@@ -342,17 +491,10 @@ def _linux_apply(args, owner, found, extra, runner, stdout):
         user_exists, group_exists, home_exists, shell, uid, gid = _linux_identity()
     if not user_exists:
         raise AgentLockError("agentnet was not created")
-    result = runner(["id", "-nG", AGENT_USER])
-    groups = (getattr(result, "stdout", "") or "").split()
-    for name in ("sudo", "wheel", "adm"):
-        if name in groups:
-            raise AgentLockError("agentnet is in the {} group".format(name))
+    _refuse_groups(runner, ("sudo", "wheel", "adm"), "-nG")
     port = int(found["port"])
-    share = [_expand(path, owner["home"]) for path in (args.share_dir or [])]
-    for path in share:
-        if not os.path.isdir(path):
-            raise UsageError("share-dir is not a directory: {}".format(path))
-    trust = [_expand(path, owner["home"]) for path in (args.trust_exec or [])]
+    share = _share_paths(args, owner)
+    trust = _trust_paths(args, owner)
     switcher = render_switcher(port, runuser, darwin=False)
     claude = render_claude(port)
     rules = render_nft(uid, port, extra)
@@ -361,7 +503,7 @@ def _linux_apply(args, owner, found, extra, runner, stdout):
     os.close(fd)
     try:
         atomic_write(tmp, rules, 0o644)
-        _ok(runner, nft_check_argv(nft, tmp))
+        _ok(runner, nft_check_argv(nft, tmp), unsupported=True)
         os.makedirs(os.path.dirname(NFT_CONF), exist_ok=True)
         atomic_write(NFT_CONF, rules, 0o644)
         _ok(runner, nft_load_argv(nft, NFT_CONF))
@@ -378,30 +520,28 @@ def _linux_apply(args, owner, found, extra, runner, stdout):
     entries = credential_entries(roots, owner["home"], classify_path)
     for command in setfacl_commands(entries):
         _ok(runner, command)
+    spec = "u:{}:r-x,m::r-x".format(AGENT_USER)
     for path in trust:
-        if os.path.isdir(path) and not os.path.islink(path):
-            spec = "u:{}:r-x,m::r-x".format(AGENT_USER)
-        else:
-            spec = "u:{}:r-x,m::r-x".format(AGENT_USER)
-        _ok(runner, ["setfacl", "-m", spec, path])
-    runner(["claude", "daemon", "stop", "--any"])
-    setting_paths = [os.path.join(owner["home"], ".claude", "settings.json")]
-    for path in args.claude_dir or []:
-        setting_paths.append(os.path.join(_expand(path, owner["home"]), "settings.json"))
-    for path in _account_dirs(owner):
-        setting_paths.append(os.path.join(path, "settings.json"))
-    settings = _write_settings(setting_paths, CLAUDE_WRAPPER_PATH)
+        if os.path.islink(path):
+            raise UsageError("refusing a symlink: {}".format(path))
+        _ok(runner, ["setfacl", "-h", "-m", spec, path])
+    setting_paths = _posix_settings_paths(args, owner)
+    settings_saved = _snapshot(setting_paths)
+    try:
+        _stop_claude_daemon(runner)
+    except AgentLockError:
+        _restore(saved)
+        raise
+    settings = _write_settings(setting_paths, CLAUDE_WRAPPER_PATH, owner)
     old = load_state()
     if not _proxy_check(runner, [runuser, "--preserve-environment", "-u", AGENT_USER, "--", SWITCHER_PATH], proxy_url(port)):
-        _restore(saved)
+        _restore(saved + settings_saved)
         if old and old.get("port"):
             _ok(runner, nft_load_argv(nft, NFT_CONF))
         else:
             runner([nft, "delete", "table", "inet", "agentlock"])
         raise AgentLockError("proxy check failed; kept the previous port")
-    data = apply_install_fields(old, port, extra, found.get("controller") or "", found.get("secret") or "")
-    if not old:
-        data = new_state(owner, port, found.get("controller") or "", found.get("secret") or "", extra)
+    data = _state_after_install(old, owner, port, extra, found)
     data["agent_uid"] = uid
     data["agent_gid"] = gid
     data["agent_home"] = LINUX_AGENT_HOME
@@ -413,7 +553,7 @@ def _linux_apply(args, owner, found, extra, runner, stdout):
     data["exec_paths"] = trust
     data["claude_settings"] = settings
     data["pf_enable_token"] = ""
-    save_state(data)
+    save_state(data, owner=owner)
     for line in found.get("logs") or []:
         stdout.write(line + "\n")
     stdout.write("installed agent-lock on port {}\n".format(port))
@@ -423,12 +563,6 @@ def _linux_apply(args, owner, found, extra, runner, stdout):
 def _darwin_apply(args, owner, found, extra, runner, stdout):
     if not shutil.which("pfctl"):
         raise Unsupported("pfctl was not found")
-    share = [_expand(path, owner["home"]) for path in (args.share_dir or [])]
-    for path in share:
-        if is_tcc_path(path, owner["home"]):
-            raise UsageError("share-dir is in Desktop, Documents, or Downloads: {}".format(path))
-        if not os.path.isdir(path):
-            raise UsageError("share-dir is not a directory: {}".format(path))
     import pwd
     try:
         pwd.getpwnam(AGENT_USER)
@@ -442,9 +576,12 @@ def _darwin_apply(args, owner, found, extra, runner, stdout):
         secret_pw = (password.stdout or "").strip()
         if not secret_pw:
             raise AgentLockError("could not generate a password")
-        for command in darwin_user_plan(False):
+        for command in darwin_user_plan():
             _ok(runner, command, input_text=secret_pw + "\n" if command[0] == "sysadminctl" else None)
         secret_pw = ""
+    _refuse_groups(runner, ("admin",), "-Gn")
+    share = _share_paths(args, owner)
+    trust = _trust_paths(args, owner)
     port = int(found["port"])
     anchor = render_anchor(port, extra)
     current = _read_text(PF_CONF) or ""
@@ -458,9 +595,9 @@ def _darwin_apply(args, owner, found, extra, runner, stdout):
         os.close(fd)
         try:
             atomic_write(tmp, patched, 0o644)
-            _ok(runner, check_conf_argv(tmp))
+            _ok(runner, check_conf_argv(tmp), unsupported=True)
             atomic_write(PF_CONF, patched, 0o644)
-            _ok(runner, load_conf_argv(PF_CONF))
+            _pf_reload(runner, PF_CONF, True)
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -474,27 +611,27 @@ def _darwin_apply(args, owner, found, extra, runner, stdout):
     atomic_write(SWITCHER_PATH, render_switcher(port, "", darwin=True), 0o755)
     atomic_write(CLAUDE_WRAPPER_PATH, render_claude(port), 0o755)
     directories = [path for path in _credential_roots(owner["home"], share) if classify_path(path) == "dir"]
-    for command in acl_commands(directories, owner["home"], True):
+    for command in acl_commands(directories, owner["home"]):
         if command[1] == "-a":
             runner(command)
         else:
             _ok(runner, command)
-    runner(["claude", "daemon", "stop", "--any"])
-    setting_paths = [os.path.join(owner["home"], ".claude", "settings.json")]
-    for path in args.claude_dir or []:
-        setting_paths.append(os.path.join(_expand(path, owner["home"]), "settings.json"))
-    for path in _account_dirs(owner):
-        setting_paths.append(os.path.join(path, "settings.json"))
-    settings = _write_settings(setting_paths, CLAUDE_WRAPPER_PATH)
+    setting_paths = _posix_settings_paths(args, owner)
+    settings_saved = _snapshot(setting_paths)
+    try:
+        _stop_claude_daemon(runner)
+    except AgentLockError:
+        _restore(saved)
+        raise
+    settings = _write_settings(setting_paths, CLAUDE_WRAPPER_PATH, owner)
     if not _proxy_check(
             runner, ["/usr/bin/sudo", "--preserve-env", "-u", AGENT_USER, "--", SWITCHER_PATH], proxy_url(port)):
-        _restore(saved)
+        _restore(saved + settings_saved)
         if already:
             runner(load_anchor_argv(ANCHOR_PATH))
         raise AgentLockError("proxy check failed; kept the previous port")
     old = load_state()
-    data = new_state(owner, port, found.get("controller") or "", found.get("secret") or "", extra) if not old else apply_install_fields(
-        old, port, extra, found.get("controller") or "", found.get("secret") or "")
+    data = _state_after_install(old, owner, port, extra, found)
     try:
         user = pwd.getpwnam(AGENT_USER)
         data["agent_uid"] = user.pw_uid
@@ -510,10 +647,10 @@ def _darwin_apply(args, owner, found, extra, runner, stdout):
     data["claude_wrapper"] = CLAUDE_WRAPPER_PATH
     data["created_user"] = bool((not exists) or (old or {}).get("created_user"))
     data["share_dirs"] = share
-    data["exec_paths"] = [_expand(path, owner["home"]) for path in (args.trust_exec or [])]
+    data["exec_paths"] = trust
     data["claude_settings"] = settings
     data["pf_enable_token"] = token
-    save_state(data)
+    save_state(data, owner=owner)
     for line in found.get("logs") or []:
         stdout.write(line + "\n")
     stdout.write("installed agent-lock on port {}\n".format(port))
@@ -542,8 +679,6 @@ def _windows_profiles(runner):
 def _windows_apply(args, owner, found, extra, runner, stdout):
     require_supported(_windows_profiles(runner))
     port = int(found["port"])
-    action = user_action(False, True)
-    # The live lookup is PowerShell. A disabled account fails inside the script.
     script = (
         "$u = Get-LocalUser -Name '{user}' -ErrorAction SilentlyContinue\n"
         "if ($null -eq $u) {{ 'missing' }} elseif ($u.Enabled) {{ 'enabled' }} else {{ 'disabled' }}\n"
@@ -558,40 +693,55 @@ def _windows_apply(args, owner, found, extra, runner, stdout):
         action = user_action(False, True)
     if action == "create":
         _ok(runner, ["powershell", "-NoProfile", "-Command", new_local_user_script()])
+    admin = runner(["powershell", "-NoProfile", "-Command", windows_admin_script()])
+    if (getattr(admin, "stdout", "") or "").strip().lower() == "yes":
+        raise AgentLockError("agentnet is in the Administrators group")
     sid_result = _ok(runner, ["powershell", "-NoProfile", "-Command",
                               "(Get-LocalUser -Name '{}').Sid.Value".format(AGENT_USER)])
     sid = (sid_result.stdout or "").strip()
     if not sid.startswith("S-"):
         raise AgentLockError("could not read the agentnet SID")
+    old = load_state()
     rules = build_rules(port, extra, sid)
-    for line in render_rule_script(rules).splitlines():
-        if line.strip():
-            _ok(runner, ["powershell", "-NoProfile", "-Command", line])
-    links = []
+    new_names = rule_names(rules)
+    create_names, remove_names = rule_phases((old or {}).get("windows_rules"), new_names)
+    by_name = {rule["name"]: rule for rule in rules}
+    for name in create_names:
+        _ok(runner, ["powershell", "-NoProfile", "-Command", render_rule_script([by_name[name]]).strip()])
+    for command in uninstall_commands(remove_names):
+        runner(["powershell", "-NoProfile", "-Command", " ".join(command)])
     home = owner.get("home") or ""
+    share = _share_paths(args, owner)
+    trust = _trust_paths(args, owner)
+    links = []
     agent_home = os.path.join(os.environ.get("SystemDrive", "C:") + "\\", "Users", AGENT_USER)
-    for name in (".codex", ".cx", ".claude", ".cc"):
+    for name in CREDENTIAL_DIRS:
         target = os.path.join(home, name)
+        if os.path.islink(target):
+            continue
         if os.path.isdir(target):
             links.append((os.path.join(agent_home, name), target))
-    # CreateProfile before any junction. A missing profile is not a reason to skip the call.
     _ok(runner, ["powershell", "-NoProfile", "-Command", create_profile_script(sid)])
-    steps = link_plan(True, links)
-    for step in steps:
-        if step.startswith("mklink"):
-            _ok(runner, ["cmd", "/c", step])
+    for command in link_plan(links):
+        _ok(runner, command)
+    cmd_saved = _snapshot([WINDOWS_CMD])
     atomic_write(WINDOWS_CMD, render_windows_cmd(port, sid), 0o644)
     for command in share_icacls([target for _link, target in links]):
         runner(command)
-    for command in icacls_commands(home, [_expand(path, home) for path in (args.trust_exec or [])], os.path.isdir):
+    for command in icacls_commands(home, trust, os.path.isdir):
         runner(command)
     if not _proxy_check(runner, [], proxy_url(port)):
-        for command in uninstall_commands(rule_names(rules)):
+        _restore(cmd_saved)
+        for command in uninstall_commands(create_names):
             runner(["powershell", "-NoProfile", "-Command", " ".join(command)])
+        if old and old.get("port") and remove_names:
+            previous = build_rules(old["port"], old.get("extra_tcp") or [], sid)
+            restore_names = set(remove_names)
+            for rule in previous:
+                if rule["name"] in restore_names:
+                    runner(["powershell", "-NoProfile", "-Command", render_rule_script([rule]).strip()])
         raise AgentLockError("proxy check failed; kept the previous port")
-    old = load_state()
-    data = new_state(owner, port, found.get("controller") or "", found.get("secret") or "", extra) if not old else apply_install_fields(
-        old, port, extra, found.get("controller") or "", found.get("secret") or "")
+    data = _state_after_install(old, owner, port, extra, found)
     data["agent_sid"] = sid
     data["agent_home"] = agent_home
     data["wrapper"] = WINDOWS_CMD
@@ -599,11 +749,11 @@ def _windows_apply(args, owner, found, extra, runner, stdout):
     data["claude_settings"] = []
     data["windows_rules"] = rule_names(rules)
     data["links"] = [link for link, _target in links]
-    data["share_dirs"] = [_expand(path, home) for path in (args.share_dir or [])]
-    data["exec_paths"] = [_expand(path, home) for path in (args.trust_exec or [])]
+    data["share_dirs"] = share
+    data["exec_paths"] = trust
     data["created_user"] = bool(action == "create" or (old or {}).get("created_user"))
     data["runuser_path"] = ""
-    save_state(data)
+    save_state(data, owner=owner)
     for line in found.get("logs") or []:
         stdout.write(line + "\n")
     stdout.write("installed agent-lock on port {}\n".format(port))
@@ -618,7 +768,7 @@ def cmd_install(args, stdout=None, stderr=None, runner=None):
     owner = resolve_owner()
     if owner is None:
         raise AgentLockError("cannot resolve the installing user; refusing to write state as root", 1)
-    extra = extra_tcp_from_args(args.allow_tcp)
+    extra = list(args.allow_tcp or [])
     if sys.platform.startswith("linux"):
         found = _gather(args, owner, runner)
         return _linux_apply(args, owner, found, extra, runner, stdout)
@@ -645,18 +795,64 @@ def _remove_user_keep_home(state, runner):
         runner(["dscl", ".", "-delete", "/Users/{}".format(AGENT_USER)])
 
 
-def _unlink_recorded(path):
-    if not path:
+def _is_junction(path):
+    """Windows reparse directory. A real directory is not a junction."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return False
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    if attrs in (-1, 0xFFFFFFFF):
+        return False
+    return bool(int(attrs) & 0x400)
+
+
+def agent_uid_busy(text, agent_uid):
+    """True when a process uid matches agentnet. uid 0 is never treated as agentnet."""
+    try:
+        agent_uid = int(agent_uid)
+    except (TypeError, ValueError):
+        return False
+    if agent_uid <= 0:
+        return False
+    for line in (text or "").splitlines():
+        token = line.strip()
+        if token.isdigit() and int(token) == agent_uid:
+            return True
+    return False
+
+
+def _refuse_if_agent_busy(state, runner):
+    if sys.platform == "win32":
+        sid = state.get("agent_sid") or ""
+        if not sid or any(ch not in "S-0123456789" for ch in sid) or not sid.startswith("S-1-"):
+            return
+        script = (
+            "Get-CimInstance Win32_Process | ForEach-Object { "
+            "$out = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid; "
+            "if ($out.Sid -eq '" + sid + "') { 'busy' } }"
+        )
+        result = runner(["powershell", "-NoProfile", "-Command", script])
+        if result and "busy" in (getattr(result, "stdout", "") or "").lower():
+            raise AgentLockError("agentnet processes are still running", 1)
         return
-    if not os.path.lexists(path):
+    result = runner(["ps", "-ax", "-o", "uid="])
+    if agent_uid_busy(getattr(result, "stdout", "") if result else "", state.get("agent_uid")):
+        raise AgentLockError("agentnet processes are still running", 1)
+
+
+def _unlink_recorded(path):
+    """Remove a symlink or a junction. A real directory is left untouched."""
+    if not path or not os.path.lexists(path):
         return
     if os.path.islink(path):
         os.unlink(path)
         return
-    # A junction is a directory. Only remove it when it is not a normal directory
-    # we could mistake for the user's real tree: require the recorded path's target
-    # to differ, which lstat-only removal cannot see. Refuse real directories.
-    raise AgentLockError("recorded link is not a symlink; left it in place: {}".format(path))
+    if _is_junction(path):
+        os.rmdir(path)
+        return
+    raise AgentLockError("recorded link is not a symlink or junction; left it in place: {}".format(path))
 
 
 def _strip_settings(entries):
@@ -684,6 +880,9 @@ def cmd_uninstall(args, stdout=None, stderr=None, runner=None):
     state = load_state()
     if not state:
         raise NotInstalled()
+    _refuse_if_agent_busy(state, runner)
+    for path in state.get("links") or []:
+        _unlink_recorded(path)
     if sys.platform.startswith("linux"):
         runner(["systemctl", "disable", "--now", UNIT_NAME])
         nft = find_nft() or "nft"
@@ -693,17 +892,16 @@ def cmd_uninstall(args, stdout=None, stderr=None, runner=None):
                 os.remove(path)
         runner(["systemctl", "daemon-reload"])
     elif sys.platform == "darwin":
+        current = _read_text(PF_CONF)
+        if current is not None:
+            atomic_write(PF_CONF, unpatch_pf_conf(current), 0o644)
+        if os.path.lexists(ANCHOR_PATH) and not os.path.islink(ANCHOR_PATH):
+            os.remove(ANCHOR_PATH)
+        runner(check_conf_argv(PF_CONF))
+        _pf_reload(runner, PF_CONF, False)
         release = release_token_argv(state.get("pf_enable_token") or "")
         if release:
             runner(release)
-        current = _read_text(PF_CONF)
-        if current is not None:
-            updated = unpatch_pf_conf(current)
-            atomic_write(PF_CONF, updated, 0o644)
-            runner(check_conf_argv(PF_CONF))
-            runner(load_conf_argv(PF_CONF))
-        if os.path.lexists(ANCHOR_PATH) and not os.path.islink(ANCHOR_PATH):
-            os.remove(ANCHOR_PATH)
         for path in (SWITCHER_PATH, CLAUDE_WRAPPER_PATH):
             if os.path.lexists(path) and not os.path.isdir(path):
                 os.remove(path)
@@ -712,8 +910,6 @@ def cmd_uninstall(args, stdout=None, stderr=None, runner=None):
             runner(["powershell", "-NoProfile", "-Command", " ".join(command)])
         if os.path.isfile(WINDOWS_CMD):
             os.remove(WINDOWS_CMD)
-    for path in state.get("links") or []:
-        _unlink_recorded(path)
     if sys.platform != "win32":
         _strip_settings(state.get("claude_settings"))
     _remove_user_keep_home(state, runner)
@@ -737,37 +933,58 @@ def cmd_exec(tail):
     return 1
 
 
+def open_directory_nofollow(path):
+    """Open a directory fd that fails when the path is a symlink."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif os.path.islink(path):
+        raise OSError("refusing a symlink")
+    return os.open(path, flags)
+
+
+def prepare_bind_dir(path, euid, owner_uid, gid):
+    """fchown and fchmod the directory fd. A replaced symlink never receives the mode."""
+    if euid != 0:
+        raise AgentLockError("agent-lock: bind-bin needs root; run it with sudo", 1)
+    try:
+        fd = open_directory_nofollow(path)
+    except OSError:
+        raise UsageError("agent-lock: bind-bin refuses a symlink or a non-directory")
+    try:
+        st = os.fstat(fd)
+        code, message = validate_bind_bin(
+            euid, False, stat.S_ISDIR(st.st_mode), st.st_uid, owner_uid)
+        if code == 2:
+            raise UsageError(message)
+        if code:
+            raise AgentLockError(message, code)
+        os.fchown(fd, -1, gid)
+        os.fchmod(fd, bind_bin_mode(stat.S_IMODE(st.st_mode)))
+    finally:
+        os.close(fd)
+
+
 def cmd_bind_bin(args):
     if sys.platform == "darwin":
         raise Unsupported("bind-bin is not used on macOS")
     if sys.platform == "win32":
         raise Unsupported("bind-bin is not used on Windows")
     euid = os.geteuid() if hasattr(os, "geteuid") else 0
-    code, message = validate_bind_bin(euid, False, True, 0, 0)
     if euid != 0:
-        raise AgentLockError(message, code)
-    path = args.path
-    try:
-        st = os.lstat(path)
-    except OSError as exc:
-        raise UsageError(str(exc))
+        raise AgentLockError("agent-lock: bind-bin needs root; run it with sudo", 1)
     owner = resolve_owner()
     if owner is None:
         raise AgentLockError("cannot resolve the installing user", 1)
-    code, message = validate_bind_bin(
-        euid, stat.S_ISLNK(st.st_mode), stat.S_ISDIR(st.st_mode), st.st_uid, owner["uid"])
-    if code == 2:
-        raise UsageError(message)
-    if code:
-        raise AgentLockError(message, code)
     state = load_state()
     if not state:
         raise NotInstalled()
     import grp
     gid = grp.getgrnam(AGENT_USER).gr_gid
-    os.chown(path, -1, gid)
-    os.chmod(path, bind_bin_mode(stat.S_IMODE(st.st_mode)))
-    absolute = os.path.abspath(path)
+    prepare_bind_dir(args.path, euid, owner["uid"], gid)
+    absolute = os.path.abspath(args.path)
     dirs = list(state.get("bin_dirs") or [])
     if absolute not in dirs:
         dirs.append(absolute)

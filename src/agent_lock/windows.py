@@ -6,8 +6,9 @@ ranges and omits an empty range when the port is 1 or 65535.
 
 import ipaddress
 import os
+import sys
 
-from .errors import AgentLockError, Unsupported
+from .errors import AgentLockError, Unsupported, UsageError
 from .state import AGENT_USER
 
 # Doctor rejects these. They are not written into rules.
@@ -108,9 +109,9 @@ def build_rules(port, extra_tcp, sid):
         plain = not extra_tcp
         for start, end in ranges:
             if plain and start == 1:
-                suffix = "{}-tcp-low".format(prefix)
+                suffix = "{}-tcp-{}-low".format(prefix, port)
             elif plain and end == 65535:
-                suffix = "{}-tcp-high".format(prefix)
+                suffix = "{}-tcp-{}-high".format(prefix, port)
             else:
                 suffix = "{}-tcp-{}-{}".format(prefix, start, end)
             rules.append(_rule(suffix, address, "TCP", _range_text(start, end), sid))
@@ -255,22 +256,83 @@ def share_icacls(paths):
     ]
 
 
+def _is_reparse(path):
+    if os.path.islink(path):
+        return True
+    if sys.platform != "win32" or not path or not os.path.exists(path):
+        return False
+    import ctypes
+    attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    if attrs in (-1, 0xFFFFFFFF):
+        return False
+    return bool(int(attrs) & 0x400)
+
+
+def _traverse_ancestors(path, owner_home):
+    """Directories between the path and the home. The home itself is excluded."""
+    home = os.path.abspath(owner_home)
+    current = os.path.dirname(os.path.abspath(path))
+    found = []
+    while current and os.path.normcase(current) != os.path.normcase(home):
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        try:
+            if os.path.commonpath([current, home]) != home:
+                break
+        except ValueError:
+            break
+        found.append(current)
+        current = parent
+    found.reverse()
+    return found
+
+
 def icacls_commands(owner_home, trust_exec, directory_fn):
-    """Owner home gets traverse (X) only. Python home from --trust-exec gets (OI)(CI)(RX)."""
+    """Home gets (X) only. A directory gets inherited RX. A file gets (RX) only."""
     commands = [["icacls", owner_home, "/grant", "{}:(X)".format(AGENT_USER)]]
-    homes = []
+    seen = {os.path.normcase(os.path.abspath(owner_home))}
     for path in trust_exec or []:
+        if _is_reparse(path):
+            raise UsageError("refusing a symlink: {}".format(path))
         if directory_fn(path):
             grant = "{}:(OI)(CI)(RX)".format(AGENT_USER)
-            commands.append(["icacls", path, "/grant", grant])
         else:
-            commands.append(["icacls", path, "/grant", "{}:(RX)".format(AGENT_USER)])
-            parent = os.path.dirname(path)
-            if parent and parent not in homes:
-                homes.append(parent)
-    for home in homes:
-        commands.append(["icacls", home, "/grant", "{}:(OI)(CI)(RX)".format(AGENT_USER)])
+            grant = "{}:(RX)".format(AGENT_USER)
+        commands.append(["icacls", path, "/grant", grant])
+        for ancestor in _traverse_ancestors(path, owner_home):
+            key = os.path.normcase(os.path.abspath(ancestor))
+            if key in seen:
+                continue
+            seen.add(key)
+            commands.append(["icacls", ancestor, "/grant", "{}:(X)".format(AGENT_USER)])
     return commands
+
+
+def state_acl_commands(path, owner_name):
+    """SYSTEM and Administrators full control, installing user read. No Users ACE."""
+    if not owner_name or any(ch in owner_name for ch in "\\/\"\r\n\t &|<>"):
+        raise AgentLockError("installing user name is not safe for an ACL")
+    if owner_name.lower() in ("users", "agentnet", "everyone", "authenticated users"):
+        raise AgentLockError("refusing a state ACL for {}".format(owner_name))
+    return [
+        "icacls", path, "/inheritance:r", "/grant:r",
+        "*S-1-5-18:(F)",
+        "*S-1-5-32-544:(F)",
+        "{}:(R)".format(owner_name),
+    ]
+
+
+def apply_state_acl(path, owner_name, runner=None):
+    """Explicit DACL. os.chmod is not an ACL on Windows."""
+    command = state_acl_commands(path, owner_name)
+    if runner is None:
+        import subprocess
+        subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False)
+    else:
+        runner(command)
 
 
 def create_profile_script(sid):
@@ -302,15 +364,154 @@ def create_profile_script(sid):
     ).format(sid=sid, user=AGENT_USER)
 
 
-def link_plan(profile_ready, links):
-    """CreateProfile (or an existing profile) before any junction."""
-    steps = ["CreateProfile"]
-    if not profile_ready:
-        steps.append("fail-profile")
-    else:
-        for link, target in links:
-            steps.append("mklink /J {} {}".format(link, target))
-    return steps
+def link_plan(links):
+    """Junction argv lists. CreateProfile is a separate call, not a plan step."""
+    return [["cmd", "/c", "mklink", "/J", link, target] for link, target in links]
+
+
+def rule_phases(old_names, new_names):
+    """Names to create, then stored names that are not in the new set."""
+    old_names = list(old_names or [])
+    new_names = list(new_names or [])
+    old_set = set(old_names)
+    new_set = set(new_names)
+    create = [name for name in new_names if name not in old_set]
+    remove = [name for name in old_names if name not in new_set]
+    return create, remove
+
+
+def _ports_in_spec(spec):
+    if spec is None:
+        return set(range(1, 65536))
+    text = str(spec).strip()
+    if text == "" or text.lower() in ("any", "*"):
+        return set(range(1, 65536))
+    found = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left, right = part.split("-", 1)
+            found.update(range(int(left), int(right) + 1))
+        elif part.isdigit():
+            found.add(int(part))
+    return found
+
+
+def windows_observed(rules, port):
+    """(blocks leave the proxy open, extra loopback TCP holes).
+
+    `None` extras means the ruleset was not parsed. An empty list means no extra hole.
+    """
+    if not rules:
+        return False, None
+    port = int(port)
+    covers = any(rule_covers_proxy(rule, port) for rule in rules)
+    extras = []
+    families_blocked = True
+    for host in ("127.0.0.1", "::1"):
+        blocked = set()
+        saw = False
+        for rule in rules:
+            if str(rule.get("action", "")).lower() != "block":
+                continue
+            protocol = str(rule.get("protocol", "")).upper()
+            if protocol not in ("ANY", "TCP"):
+                continue
+            if rule.get("enabled") is False:
+                continue
+            if not address_contains(rule.get("remote_address"), host):
+                continue
+            saw = True
+            blocked.update(_ports_in_spec(rule.get("remote_port")))
+        if not saw:
+            families_blocked = False
+        for candidate in range(1, 65536):
+            if candidate == port or candidate in blocked:
+                continue
+            extras.append("{}:{}".format(host, candidate))
+            if len(extras) > 32:
+                break
+    return (not covers) and families_blocked and len(extras) <= 32, extras
+
+
+_PROTO_NUMBERS = {
+    "1": "ICMPv4",
+    "6": "TCP",
+    "17": "UDP",
+    "58": "ICMPv6",
+    "256": "ANY",
+}
+
+
+def normalize_firewall_rule(item):
+    proto = item.get("Protocol", item.get("protocol", ""))
+    if isinstance(proto, int):
+        proto = str(proto)
+    proto = _PROTO_NUMBERS.get(str(proto), str(proto))
+    address = item.get("RemoteAddress", item.get("remote_address"))
+    if isinstance(address, list):
+        address = address[0] if address else None
+    remote_port = item.get("RemotePort", item.get("remote_port"))
+    if isinstance(remote_port, list):
+        remote_port = ",".join(str(part) for part in remote_port)
+    enabled = item.get("Enabled", item.get("enabled", True))
+    return {
+        "name": item.get("Name", item.get("name")),
+        "action": item.get("Action", item.get("action", "Block")),
+        "protocol": proto,
+        "remote_address": address,
+        "remote_port": remote_port,
+        "enabled": enabled,
+    }
+
+
+def windows_firewall_report(profiles, rules, port):
+    """gpo, outbound, firewall_ok, extra_tcp_observed from already-parsed objects."""
+    gpo = gpo_problem(profiles)
+    outbound = default_outbound_problem(profiles)
+    cleaned = []
+    for rule in rules or []:
+        if "remote_address" in rule or "protocol" in rule:
+            cleaned.append(rule)
+        else:
+            cleaned.append(normalize_firewall_rule(rule))
+    ok, extras = windows_observed(cleaned, port)
+    if gpo or outbound:
+        ok = False
+    return gpo, outbound, ok, extras
+
+
+def windows_profile_script():
+    return (
+        "Get-NetFirewallProfile | "
+        "Select-Object Name, AllowLocalFirewallRules, AllowLocalPolicyMerge, DefaultOutboundAction | "
+        "ConvertTo-Json -Compress"
+    )
+
+
+def windows_rule_script(sid):
+    """Outbound Block rules for this SID. The SID is a literal, not a name."""
+    if not sid or any(ch not in "S-0123456789" for ch in sid) or not sid.startswith("S-1-"):
+        raise AgentLockError("could not read the agentnet SID")
+    return (
+        "Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True | "
+        "Where-Object { $_.LocalUser -like '*" + sid + "*' } | ForEach-Object { "
+        "$port = $_ | Get-NetFirewallPortFilter; "
+        "$addr = $_ | Get-NetFirewallAddressFilter; "
+        "[PSCustomObject]@{ Name=$_.Name; Action='Block'; Protocol=$port.Protocol; "
+        "RemoteAddress=$addr.RemoteAddress; RemotePort=$port.RemotePort; Enabled=$true } "
+        "} | ConvertTo-Json -Compress"
+    )
+
+
+def windows_admin_script():
+    return (
+        "$hit = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Name -eq 'agentnet' -or $_.Name -like '*\\agentnet' }\n"
+        "if ($hit) { 'yes' } else { 'no' }\n"
+    )
 
 
 def new_local_user_script():

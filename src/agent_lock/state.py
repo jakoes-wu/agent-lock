@@ -2,7 +2,6 @@
 
 import json
 import os
-import stat
 import sys
 import tempfile
 
@@ -15,8 +14,8 @@ SUDOERS_PATH = "/etc/sudoers.d/agent-lock"
 LINUX_AGENT_HOME = "/var/lib/agentnet"
 DARWIN_AGENT_HOME = "/Users/agentnet"
 WINDOWS_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "agent-lock")
-WINDOWS_STATE = os.path.join(WINDOWS_DIR, "state.json")
 WINDOWS_CMD = os.path.join(WINDOWS_DIR, "agent-lock.cmd")
+CREDENTIAL_DIRS = (".codex", ".cx", ".claude", ".cc")
 
 STATE_DEFAULTS = {
     "version": 1,
@@ -49,13 +48,6 @@ STATE_DEFAULTS = {
 
 def proxy_url(port):
     return "http://127.0.0.1:{}".format(int(port))
-
-
-def extra_tcp_from_args(values):
-    """This install's --allow-tcp list. Omitted flag clears; it is not inherited."""
-    if not values:
-        return []
-    return list(values)
 
 
 def is_root():
@@ -112,8 +104,7 @@ def config_base(owner):
 
 def state_path(owner=None):
     if sys.platform == "win32":
-        base = os.environ.get("ProgramData", r"C:\ProgramData")
-        return os.path.join(base, "agent-lock", "state.json")
+        return os.path.join(WINDOWS_DIR, "state.json")
     if owner is None:
         owner = resolve_owner()
     base = config_base(owner)
@@ -200,14 +191,48 @@ def load_state(path=None):
     return merged
 
 
-def save_state(data, path=None):
+def save_state(data, path=None, owner=None):
     if path is None:
         path = state_path()
     if not path:
         raise AgentLockError("no state directory for the installing user; refusing to write as root")
     payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
     atomic_write(path, payload, 0o600)
+    _own_state_file(path, data, owner)
     return path
+
+
+def _own_state_file(path, data, owner):
+    """POSIX: chown back to the installing user. Windows: explicit ACL, not chmod."""
+    if sys.platform == "win32":
+        name = ""
+        if owner:
+            name = owner.get("name") or ""
+        if not name:
+            name = data.get("owner") or ""
+        if name:
+            from .windows import apply_state_acl
+            apply_state_acl(path, name)
+        return
+    if not is_root():
+        return
+    uid = owner.get("uid") if owner else None
+    if not uid:
+        uid = data.get("owner_uid")
+    if not uid:
+        return
+    import pwd
+    try:
+        gid = pwd.getpwuid(int(uid)).pw_gid
+    except KeyError:
+        return
+    os.chown(path, int(uid), gid)
+    directory = os.path.dirname(path)
+    if directory:
+        try:
+            os.chown(directory, int(uid), gid)
+        except OSError:
+            pass
 
 
 def secret_label(secret):
@@ -247,5 +272,4 @@ def strip_claude_settings(document):
     return document, empty
 
 
-def file_mode(path):
-    return stat.S_IMODE(os.lstat(path).st_mode)
+
